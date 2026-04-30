@@ -1,0 +1,15 @@
+# --- Security / Secrets ---
+.env
+
+# --- Python Generated Files ---
+__pycache__/
+*.py[cod]
+
+# --- Virtual Environments (If you use them) ---
+venv/
+env/
+
+# --- Local Testing Data ---
+S3files/
+*.cdf
+*.csv
