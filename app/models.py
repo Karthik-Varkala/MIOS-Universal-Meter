@@ -15,3 +15,8 @@ class S3Request(BaseModel):
     bucket_name: str
     object_key: str
     download_dir: Optional[str] = "S3files"
+
+
+class LoadProfileExportRequest(BaseModel):
+    meter_no: str
+    date: str
