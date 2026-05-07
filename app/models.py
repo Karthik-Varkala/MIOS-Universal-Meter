@@ -20,3 +20,8 @@ class S3Request(BaseModel):
 class LoadProfileExportRequest(BaseModel):
     meter_no: str
     date: str
+
+
+class MeterDateRequest(BaseModel):
+    meter_no: str
+    date: str

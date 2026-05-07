@@ -81,7 +81,15 @@ def format_datetime_to_iso(datetime_str):
     if not datetime_str:
         return ""
 
-    for datetime_format in ("%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M"):
+    for datetime_format in (
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S:%f",
+        "%d/%m/%Y %H:%M:%S:%f",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
         try:
             parsed_datetime = datetime.strptime(datetime_str, datetime_format)
             return parsed_datetime.strftime("%Y-%m-%dT%H:%M:%S")
@@ -147,13 +155,14 @@ def extract_billing(root, meter_no):
         for sub in d3:
             dt = sub.get("DATETIME")
             reset_method = sub.get("MECHANISM", "")
+
             if not reset_method:
                 b2 = sub.find("B2")
                 if b2 is not None:
                     reset_method = b2.get("MECHANISM", "")
 
             for b_tag in sub:
-                if b_tag.tag == "B2":
+                if b_tag.tag not in ["B2", "B5"]:
                     continue
 
                 row = {
@@ -165,6 +174,68 @@ def extract_billing(root, meter_no):
                 }
                 row.update(normalize_billing_tag_data(b_tag))
                 data.append(row)
+
+    return data
+
+
+def extract_events(root, meter_no):
+    data = []
+
+    for event_index, event in enumerate(root.findall(".//D5/EVENT"), start=1):
+        event_time = event.get("TIME", "")
+        row = {
+            "meter_no": meter_no,
+            "event_index": event_index,
+            "code": event.get("CODE", ""),
+            "status": event.get("STATUS", ""),
+            "logid": event.get("LOGID", ""),
+            "time": event_time,
+            "timestamp": format_datetime_to_iso(event_time),
+            "parameters": [],
+        }
+
+        for parameter_index, snapshot in enumerate(event.findall("SNAPSHOT"), start=1):
+            row["parameters"].append(
+                {
+                    "parameter_index": parameter_index,
+                    "code": snapshot.get("PARAMCODE", ""),
+                    "value": snapshot.get("VALUE", ""),
+                    "unit": snapshot.get("UNIT", ""),
+                }
+            )
+
+        data.append(row)
+
+    return data
+
+
+def extract_day_profile(root, meter_no):
+    data = []
+    d6 = root.find(".//D6")
+
+    if d6 is None:
+        return data
+
+    for snapshot in d6.findall("SNAPSHOT"):
+        snapshot_datetime = snapshot.get("DATETIME", "")
+        row = {
+            "meter_no": meter_no,
+            "datetime": snapshot_datetime,
+            "timestamp": format_datetime_to_iso(snapshot_datetime),
+            "parameters": [],
+        }
+
+        for register in snapshot.findall("REGISTER"):
+            row["parameters"].append(
+                {
+                    "code": register.get("PARAMCODE", ""),
+                    "value": register.get("VALUE", ""),
+                    "unit": register.get("UNIT", ""),
+                }
+            )
+
+        data.append(row)
+
     return data
 
 

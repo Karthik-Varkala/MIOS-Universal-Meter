@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from . import parser
-from .models import DirectoryRequest, FileRequest, LoadProfileExportRequest, S3Request
+from .models import DirectoryRequest, FileRequest, LoadProfileExportRequest, MeterDateRequest, S3Request
 
 
 load_dotenv()
@@ -32,6 +32,9 @@ DB_NAME = os.getenv("DB_NAME", "MDMS")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_LOAD_PROFILE_TABLE = os.getenv("DB_LOAD_PROFILE_TABLE", "LOAD_PROFILE")
+DB_DAY_PROFILE_TABLE = os.getenv("DB_DAY_PROFILE_TABLE", "DAY_PROFILE")
+DB_EVENT_TABLE = os.getenv("DB_EVENT_TABLE", "EVENT_DATA")
+DB_EVENT_PARAMETER_TABLE = os.getenv("DB_EVENT_PARAMETER_TABLE", "EVENT_PARAMETER_DATA")
 
 es_client = Elasticsearch(
     ES_ENDPOINT,
@@ -39,6 +42,8 @@ es_client = Elasticsearch(
 )
 
 LOAD_PROFILE_INDEX = "meter-load-profile-data"
+EVENT_INDEX = "meter-event-data"
+DAY_PROFILE_INDEX = "meter-day-profile-data"
 LOAD_PROFILE_PARAMETER_MAPPINGS = [
     ("Current R", "CURRENT_R", "P2-1-1-4-0"),
     ("Current Y", "CURRENT_Y", "P2-1-2-4-0"),
@@ -52,6 +57,31 @@ LOAD_PROFILE_PARAMETER_MAPPINGS = [
     ("kvarh-lag", "KVARH_LAG", "P7-2-1-0-0"),
     ("kvarh-lead", "KVARH_LEAD", "P7-2-2-0-0"),
 ]
+DAY_PROFILE_PARAMETER_MAPPINGS = [
+    ("kwh_forwarded_total", "KWH_FORWARDED_TOTAL", "P7-1-18-2-0"),
+    ("kwh_forwarded_fund", "KWH_FORWARDED_FUND", "P7-1-18-1-0"),
+    ("kwh_import_fund", "KWH_IMPORT_FUND", "P7-1-5-1-0"),
+    ("kwh_export_total", "KWH_EXPORT_TOTAL", "P7-1-6-2-0"),
+    ("kwh_export_fund", "KWH_EXPORT_FUND", "P7-1-6-1-0"),
+    ("kvah_forwarded_total", "KVAH_FORWARDED_TOTAL", "P7-3-18-2-0"),
+    ("kvah_import_total", "KVAH_IMPORT_TOTAL", "P7-3-5-2-0"),
+    ("kvah_export_total", "KVAH_EXPORT_TOTAL", "P7-3-6-0-0"),
+    ("kvarh_q1_lag", "KVARH_Q1_LAG", "P7-2-1-0-0"),
+    ("kvarh_q2_lead", "KVARH_Q2_LEAD", "P7-2-2-0-0"),
+    ("kvarh_q3", "KVARH_Q3", "P7-2-3-0-0"),
+    ("kvarh_q4", "KVARH_Q4", "P7-2-4-0-0"),
+    ("kwh_import_total_snap", "KWH_IMPORT_TOTAL_SNAPSHOT", "P1202-1-5-2-0"),
+    ("kwh_forwarded_fund_snap", "KWH_FORWARDED_FUND_SNAPSHOT", "P1203-1-14-1-0"),
+    ("kvarh_q1_snap", "KVARH_Q1_SNAPSHOT", "P1202-2-19-0-0"),
+    ("kvarh_q4_snap", "KVARH_Q4_SNAPSHOT", "P1202-2-20-0-0"),
+]
+EVENT_SQL_UNIQUE_KEY_COLUMNS = (
+    "METER_NO",
+    "EVENT_DATE_TIME",
+    "SOURCE_EVENT_CODE",
+    "LOGID",
+    "SOURCE_EVENT_INDEX",
+)
 
 INSTANTANEOUS_HEADERS = ["meter_no", "code", "value", "unit"]
 LOAD_PROFILE_CORE_HEADERS = ["meter_no", "date", "interval", "timestamp"]
@@ -462,6 +492,348 @@ def save_load_profile_rows_to_sql(rows: list):
         connection.close()
 
 
+def ensure_day_profile_sql_table(connection):
+    """Create the day profile table if it does not already exist."""
+    fixed_columns = [
+        ("METER_NO", "VARCHAR(64) NOT NULL"),
+        ("DATETIME_TIMESTAMP", "DATETIME NOT NULL"),
+    ]
+    parameter_columns = [
+        (sql_column, "DECIMAL(18,6) NULL")
+        for _, sql_column, _ in DAY_PROFILE_PARAMETER_MAPPINGS
+    ]
+    column_defs = [
+        f"{quote_mysql_identifier(column_name)} {column_type}"
+        for column_name, column_type in fixed_columns + parameter_columns
+    ]
+    primary_key = ", ".join(
+        quote_mysql_identifier(column_name)
+        for column_name in ("METER_NO", "DATETIME_TIMESTAMP")
+    )
+    create_table_sql = (
+        f"CREATE TABLE IF NOT EXISTS {quote_mysql_identifier(DB_DAY_PROFILE_TABLE)} ("
+        f"{', '.join(column_defs)}, PRIMARY KEY ({primary_key}))"
+    )
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(create_table_sql)
+        connection.commit()
+    finally:
+        cursor.close()
+
+
+def get_day_profile_sql_headers():
+    return ["METER_NO", "DATETIME_TIMESTAMP"] + [
+        sql_column for _, sql_column, _ in DAY_PROFILE_PARAMETER_MAPPINGS
+    ]
+
+
+def prepare_day_profile_sql_value(column_name: str, value):
+    return prepare_load_profile_sql_value(column_name, value)
+
+
+def build_day_profile_sql_rows(hits: list):
+    """Flatten selected D6 register codes into SQL-table-shaped rows."""
+    code_to_sql_column = {
+        code: sql_column
+        for _, sql_column, code in DAY_PROFILE_PARAMETER_MAPPINGS
+    }
+    rows = []
+
+    for hit in hits:
+        source = hit.get("_source", {})
+        row = {
+            "METER_NO": source.get("meter_no", ""),
+            "DATETIME_TIMESTAMP": source.get("timestamp", ""),
+        }
+        row.update(
+            {
+                sql_column: None
+                for _, sql_column, _ in DAY_PROFILE_PARAMETER_MAPPINGS
+            }
+        )
+
+        for parameter in source.get("parameters", []):
+            code = parameter.get("code")
+            sql_column = code_to_sql_column.get(code)
+            if sql_column:
+                row[sql_column] = parameter.get("value", "")
+
+        rows.append(row)
+
+    return sorted(rows, key=lambda item: item["DATETIME_TIMESTAMP"])
+
+
+def save_day_profile_rows_to_sql(rows: list):
+    """Persist day profile rows to the configured MySQL table."""
+    connection = get_mysql_connection()
+    headers = get_day_profile_sql_headers()
+    quoted_columns = ", ".join(quote_mysql_identifier(header) for header in headers)
+    placeholders = ", ".join(["%s"] * len(headers))
+    update_clause = ", ".join(
+        f"{quote_mysql_identifier(header)} = VALUES({quote_mysql_identifier(header)})"
+        for header in headers
+        if header not in {"METER_NO", "DATETIME_TIMESTAMP"}
+    )
+    insert_sql = (
+        f"INSERT INTO {quote_mysql_identifier(DB_DAY_PROFILE_TABLE)} ({quoted_columns}) "
+        f"VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_clause}"
+    )
+    values = [
+        tuple(prepare_day_profile_sql_value(header, row.get(header)) for header in headers)
+        for row in rows
+    ]
+
+    try:
+        ensure_day_profile_sql_table(connection)
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(insert_sql, values)
+            connection.commit()
+            affected_rows = cursor.rowcount
+            return affected_rows
+        finally:
+            cursor.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
+    finally:
+        connection.close()
+
+
+def ensure_event_sql_tables(connection):
+    """Create the event parent and parameter child tables if they do not exist."""
+    event_table = quote_mysql_identifier(DB_EVENT_TABLE)
+    parameter_table = quote_mysql_identifier(DB_EVENT_PARAMETER_TABLE)
+    unique_key = ", ".join(
+        quote_mysql_identifier(column_name)
+        for column_name in EVENT_SQL_UNIQUE_KEY_COLUMNS
+    )
+    create_event_table_sql = (
+        f"CREATE TABLE IF NOT EXISTS {event_table} ("
+        f"{quote_mysql_identifier('ID')} BIGINT NOT NULL AUTO_INCREMENT, "
+        f"{quote_mysql_identifier('METER_NO')} VARCHAR(64) NOT NULL, "
+        f"{quote_mysql_identifier('SOURCE_EVENT_CODE')} VARCHAR(128) NOT NULL, "
+        f"{quote_mysql_identifier('EVENT_STATUS')} VARCHAR(128) NULL, "
+        f"{quote_mysql_identifier('LOGID')} VARCHAR(128) NOT NULL, "
+        f"{quote_mysql_identifier('EVENT_DATE_TIME')} DATETIME NOT NULL, "
+        f"{quote_mysql_identifier('SOURCE_EVENT_INDEX')} INT NOT NULL, "
+        f"PRIMARY KEY ({quote_mysql_identifier('ID')}), "
+        f"UNIQUE KEY {quote_mysql_identifier('UQ_EVENT')} ({unique_key})"
+        f")"
+    )
+    create_parameter_table_sql = (
+        f"CREATE TABLE IF NOT EXISTS {parameter_table} ("
+        f"{quote_mysql_identifier('ID')} BIGINT NOT NULL AUTO_INCREMENT, "
+        f"{quote_mysql_identifier('EVENT_ID')} BIGINT NOT NULL, "
+        f"{quote_mysql_identifier('PARAMETER_INDEX')} INT NOT NULL, "
+        f"{quote_mysql_identifier('PARAMETER_CODE')} VARCHAR(128) NOT NULL, "
+        f"{quote_mysql_identifier('VALUE')} VARCHAR(255) NULL, "
+        f"{quote_mysql_identifier('UNIT')} VARCHAR(64) NULL, "
+        f"PRIMARY KEY ({quote_mysql_identifier('ID')}), "
+        f"UNIQUE KEY {quote_mysql_identifier('UQ_EVENT_PARAMETER')} "
+        f"({quote_mysql_identifier('EVENT_ID')}, {quote_mysql_identifier('PARAMETER_INDEX')}), "
+        f"CONSTRAINT {quote_mysql_identifier('FK_EVENT_PARAMETER_EVENT')} "
+        f"FOREIGN KEY ({quote_mysql_identifier('EVENT_ID')}) "
+        f"REFERENCES {event_table} ({quote_mysql_identifier('ID')}) "
+        f"ON DELETE CASCADE"
+        f")"
+    )
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(create_event_table_sql)
+        cursor.execute(create_parameter_table_sql)
+        cursor.execute(f"SHOW COLUMNS FROM {event_table}")
+        event_columns = {column[0] for column in cursor.fetchall()}
+        required_event_columns = {
+            "ID",
+            "METER_NO",
+            "SOURCE_EVENT_CODE",
+            "EVENT_STATUS",
+            "LOGID",
+            "EVENT_DATE_TIME",
+            "SOURCE_EVENT_INDEX",
+        }
+        if not required_event_columns.issubset(event_columns):
+            missing_columns = sorted(required_event_columns - event_columns)
+            raise RuntimeError(
+                f"{DB_EVENT_TABLE} already exists with the old event schema. "
+                f"Missing columns: {', '.join(missing_columns)}. "
+                f"Create a migrated parent event table or rename DB_EVENT_TABLE."
+            )
+
+        cursor.execute(f"SHOW COLUMNS FROM {parameter_table}")
+        parameter_columns = {column[0] for column in cursor.fetchall()}
+        required_parameter_columns = {
+            "ID",
+            "EVENT_ID",
+            "PARAMETER_INDEX",
+            "PARAMETER_CODE",
+            "VALUE",
+            "UNIT",
+        }
+        if not required_parameter_columns.issubset(parameter_columns):
+            missing_columns = sorted(required_parameter_columns - parameter_columns)
+            raise RuntimeError(
+                f"{DB_EVENT_PARAMETER_TABLE} already exists with an incompatible schema. "
+                f"Missing columns: {', '.join(missing_columns)}."
+            )
+
+        connection.commit()
+    finally:
+        cursor.close()
+
+
+def prepare_event_sql_datetime(value):
+    return prepare_load_profile_sql_value("DATETIME_TIMESTAMP", value)
+
+
+def build_event_sql_rows(hits: list):
+    """Build parent event rows with child parameter rows for normalized SQL storage."""
+    grouped_rows = {}
+
+    for hit in hits:
+        source = hit.get("_source", {})
+        meter_no = source.get("meter_no", "")
+        event_index = source.get("event_index") or 0
+        timestamp = source.get("timestamp", "") or parser.format_datetime_to_iso(source.get("time", ""))
+        source_event_code = source.get("code", "")
+        logid = source.get("logid", "")
+        row_key = (meter_no, timestamp, source_event_code, logid, event_index)
+
+        if row_key not in grouped_rows:
+            grouped_rows[row_key] = {
+                "METER_NO": meter_no,
+                "EVENT_DATE_TIME": timestamp,
+                "SOURCE_EVENT_CODE": source_event_code,
+                "EVENT_STATUS": source.get("status", ""),
+                "LOGID": logid,
+                "SOURCE_EVENT_INDEX": event_index,
+                "PARAMETERS": [],
+            }
+
+        row = grouped_rows[row_key]
+        if source.get("status") not in ("", None):
+            row["EVENT_STATUS"] = source.get("status", "")
+
+        for fallback_index, parameter in enumerate(source.get("parameters", []), start=1):
+            parameter_code = parameter.get("code")
+            if not parameter_code:
+                continue
+
+            row["PARAMETERS"].append(
+                {
+                    "PARAMETER_INDEX": parameter.get("parameter_index") or fallback_index,
+                    "PARAMETER_CODE": parameter_code,
+                    "VALUE": parameter.get("value"),
+                    "UNIT": parameter.get("unit"),
+                }
+            )
+
+    rows = []
+    for row in grouped_rows.values():
+        row["PARAMETERS"] = sorted(
+            row["PARAMETERS"],
+            key=lambda parameter: parameter["PARAMETER_INDEX"],
+        )
+        rows.append(row)
+
+    return sorted(
+        rows,
+        key=lambda item: (
+            item["EVENT_DATE_TIME"],
+            item["SOURCE_EVENT_CODE"],
+            item["LOGID"],
+            item["SOURCE_EVENT_INDEX"],
+        ),
+    )
+
+
+def save_event_rows_to_sql(rows: list):
+    """Persist event parent rows and their parameter child rows to MySQL."""
+    connection = get_mysql_connection()
+    event_headers = [
+        "METER_NO",
+        "SOURCE_EVENT_CODE",
+        "EVENT_STATUS",
+        "LOGID",
+        "EVENT_DATE_TIME",
+        "SOURCE_EVENT_INDEX",
+    ]
+    event_columns = ", ".join(quote_mysql_identifier(header) for header in event_headers)
+    event_placeholders = ", ".join(["%s"] * len(event_headers))
+    event_update_clause = (
+        f"{quote_mysql_identifier('EVENT_STATUS')} = VALUES({quote_mysql_identifier('EVENT_STATUS')}), "
+        f"{quote_mysql_identifier('ID')} = LAST_INSERT_ID({quote_mysql_identifier('ID')})"
+    )
+    event_insert_sql = (
+        f"INSERT INTO {quote_mysql_identifier(DB_EVENT_TABLE)} ({event_columns}) "
+        f"VALUES ({event_placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {event_update_clause}"
+    )
+    parameter_insert_sql = (
+        f"INSERT INTO {quote_mysql_identifier(DB_EVENT_PARAMETER_TABLE)} "
+        f"({quote_mysql_identifier('EVENT_ID')}, {quote_mysql_identifier('PARAMETER_INDEX')}, "
+        f"{quote_mysql_identifier('PARAMETER_CODE')}, {quote_mysql_identifier('VALUE')}, "
+        f"{quote_mysql_identifier('UNIT')}) "
+        f"VALUES (%s, %s, %s, %s, %s) "
+        f"ON DUPLICATE KEY UPDATE "
+        f"{quote_mysql_identifier('PARAMETER_CODE')} = VALUES({quote_mysql_identifier('PARAMETER_CODE')}), "
+        f"{quote_mysql_identifier('VALUE')} = VALUES({quote_mysql_identifier('VALUE')}), "
+        f"{quote_mysql_identifier('UNIT')} = VALUES({quote_mysql_identifier('UNIT')})"
+    )
+
+    try:
+        ensure_event_sql_tables(connection)
+        cursor = connection.cursor()
+        try:
+            affected_rows = 0
+            parameter_rows = 0
+            for row in rows:
+                event_values = (
+                    "" if row.get("METER_NO") is None else str(row.get("METER_NO")),
+                    "" if row.get("SOURCE_EVENT_CODE") is None else str(row.get("SOURCE_EVENT_CODE")),
+                    None if row.get("EVENT_STATUS") in ("", None) else str(row.get("EVENT_STATUS")),
+                    "" if row.get("LOGID") is None else str(row.get("LOGID")),
+                    prepare_event_sql_datetime(row.get("EVENT_DATE_TIME")),
+                    row.get("SOURCE_EVENT_INDEX") or 0,
+                )
+                cursor.execute(event_insert_sql, event_values)
+                affected_rows += cursor.rowcount
+                event_id = cursor.lastrowid
+
+                parameters = [
+                    (
+                        event_id,
+                        parameter.get("PARAMETER_INDEX"),
+                        parameter.get("PARAMETER_CODE"),
+                        None if parameter.get("VALUE") in ("", None) else str(parameter.get("VALUE")),
+                        None if parameter.get("UNIT") in ("", None) else str(parameter.get("UNIT")),
+                    )
+                    for parameter in row.get("PARAMETERS", [])
+                ]
+                if parameters:
+                    cursor.executemany(parameter_insert_sql, parameters)
+                    affected_rows += cursor.rowcount
+                    parameter_rows += len(parameters)
+
+            connection.commit()
+            return {
+                "affected_rows": affected_rows,
+                "event_rows": len(rows),
+                "parameter_rows": parameter_rows,
+            }
+        finally:
+            cursor.close()
+    except Exception as exc:
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
+    finally:
+        connection.close()
+
+
 def parse_request_date(date_str: str) -> datetime:
     for date_format in ("%d-%m-%Y", "%Y-%m-%d"):
         try:
@@ -518,6 +890,135 @@ def fetch_load_profile_month_docs_from_es(meter_no: str, date: str):
     try:
         response = es_client.search(
             index=LOAD_PROFILE_INDEX,
+            body={
+                "size": 10000,
+                "_source": source_fields,
+                "query": query,
+            },
+        )
+        return response.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_day_profile_month_docs_from_es(meter_no: str, date: str):
+    """Fetch day profile documents for a specific meter and month."""
+    target_date = parse_request_date(date)
+    hyphen_month_pattern = f"*-{target_date.strftime('%m-%Y')}*"
+    slash_month_pattern = f"*/{target_date.strftime('%m/%Y')}*"
+    source_fields = ["meter_no", "datetime", "timestamp", "parameters"]
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {"meter_no.keyword": meter_no}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"datetime.keyword": {"value": hyphen_month_pattern}}},
+                            {"wildcard": {"datetime.keyword": {"value": slash_month_pattern}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=DAY_PROFILE_INDEX,
+            body={
+                "size": 10000,
+                "_source": source_fields,
+                "query": query,
+            },
+        )
+        return response.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_event_docs_from_es(meter_no: str, date: str):
+    """Fetch event documents for a specific meter and date."""
+    target_date = parse_request_date(date)
+    hyphen_date_pattern = f"{target_date.strftime('%d-%m-%Y')}*"
+    slash_date_pattern = f"{target_date.strftime('%d/%m/%Y')}*"
+    source_fields = [
+        "meter_no",
+        "event_index",
+        "code",
+        "status",
+        "logid",
+        "time",
+        "timestamp",
+        "parameters",
+    ]
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {"meter_no.keyword": meter_no}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"time.keyword": {"value": hyphen_date_pattern}}},
+                            {"wildcard": {"time.keyword": {"value": slash_date_pattern}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=EVENT_INDEX,
+            body={
+                "size": 5000,
+                "_source": source_fields,
+                "query": query,
+            },
+        )
+        return response.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_event_month_docs_from_es(meter_no: str, date: str):
+    """Fetch event documents for a specific meter and month."""
+    target_date = parse_request_date(date)
+    hyphen_month_pattern = f"*-{target_date.strftime('%m-%Y')}*"
+    slash_month_pattern = f"*/{target_date.strftime('%m/%Y')}*"
+    source_fields = [
+        "meter_no",
+        "event_index",
+        "code",
+        "status",
+        "logid",
+        "time",
+        "timestamp",
+        "parameters",
+    ]
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {"meter_no.keyword": meter_no}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"time.keyword": {"value": hyphen_month_pattern}}},
+                            {"wildcard": {"time.keyword": {"value": slash_month_pattern}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=EVENT_INDEX,
             body={
                 "size": 10000,
                 "_source": source_fields,
@@ -639,6 +1140,56 @@ def build_billing_es_documents(flat_data: list):
         grouped_docs[doc_key]["parameters"].append(parameter)
 
     return list(grouped_docs.values())
+
+
+def build_event_es_documents(event_data: list):
+    """Attach stable document ids to parsed event records."""
+    transformed_data = []
+
+    for row in event_data:
+        meter_no = row.get("meter_no", "")
+        event_index = row.get("event_index") or 0
+        code = row.get("code", "")
+        status = row.get("status", "")
+        logid = row.get("logid", "")
+        event_time = row.get("time", "")
+
+        transformed_data.append(
+            {
+                "_id": f"{meter_no}_{event_time}_{code}_{logid}_{event_index}",
+                "meter_no": meter_no,
+                "event_index": event_index,
+                "code": code,
+                "status": status,
+                "logid": logid,
+                "time": event_time,
+                "timestamp": row.get("timestamp", ""),
+                "parameters": row.get("parameters", []),
+            }
+        )
+
+    return transformed_data
+
+
+def build_day_profile_es_documents(day_profile_data: list):
+    """Attach stable document ids to parsed D6 day profile records."""
+    transformed_data = []
+
+    for row in day_profile_data:
+        meter_no = row.get("meter_no", "")
+        snapshot_datetime = row.get("datetime", "")
+
+        transformed_data.append(
+            {
+                "_id": f"{meter_no}_{snapshot_datetime}",
+                "meter_no": meter_no,
+                "datetime": snapshot_datetime,
+                "timestamp": row.get("timestamp", ""),
+                "parameters": row.get("parameters", []),
+            }
+        )
+
+    return transformed_data
 
 
 def publish_directory_data_to_es(req: DirectoryRequest, extractor, index_name: str, transformer=None):
@@ -824,3 +1375,128 @@ def es_push_dir_billing(req: DirectoryRequest):
         index_name="meter-billing-data",
         transformer=build_billing_es_documents,
     )
+
+
+@app.post("/api/elasticsearch/event")
+def es_push_event(req: FileRequest):
+    if not os.path.isfile(req.file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    try:
+        tree = ET.parse(req.file_path)
+        meter_no = parser.get_meter_no(tree.getroot())
+        event_data = parser.extract_events(tree.getroot(), meter_no)
+        transformed_data = build_event_es_documents(event_data)
+        return publish_to_es_helper(transformed_data, index_name=EVENT_INDEX)
+    except ET.ParseError as e:
+        raise HTTPException(status_code=400, detail=f"XML Parse Error: {str(e)}")
+
+
+@app.post("/api/elasticsearch/dir/event")
+def es_push_dir_event(req: DirectoryRequest):
+    return publish_directory_data_to_es(
+        req,
+        extractor=parser.extract_events,
+        index_name=EVENT_INDEX,
+        transformer=build_event_es_documents,
+    )
+
+
+@app.post("/api/elasticsearch/event/save-to-sql")
+def save_event_from_es_to_sql(req: MeterDateRequest):
+    hits = fetch_event_docs_from_es(req.meter_no, req.date)
+    rows = build_event_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No event data found for the given meter no and date.",
+        )
+
+    save_result = save_event_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "event_table": DB_EVENT_TABLE,
+        "event_parameter_table": DB_EVENT_PARAMETER_TABLE,
+        "meter_no": req.meter_no,
+        "date": req.date,
+        "processed_event_rows": save_result["event_rows"],
+        "processed_parameter_rows": save_result["parameter_rows"],
+        "affected_rows": save_result["affected_rows"],
+    }
+
+
+@app.post("/api/elasticsearch/event/save-month-to-sql")
+def save_event_month_from_es_to_sql(req: MeterDateRequest):
+    target_date = parse_request_date(req.date)
+    hits = fetch_event_month_docs_from_es(req.meter_no, req.date)
+    rows = build_event_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No event data found for the given meter no and month.",
+        )
+
+    save_result = save_event_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "event_table": DB_EVENT_TABLE,
+        "event_parameter_table": DB_EVENT_PARAMETER_TABLE,
+        "meter_no": req.meter_no,
+        "month": target_date.strftime("%m-%Y"),
+        "processed_event_rows": save_result["event_rows"],
+        "processed_parameter_rows": save_result["parameter_rows"],
+        "affected_rows": save_result["affected_rows"],
+    }
+
+
+@app.post("/api/elasticsearch/day-profile")
+def es_push_day_profile(req: FileRequest):
+    if not os.path.isfile(req.file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    try:
+        tree = ET.parse(req.file_path)
+        meter_no = parser.get_meter_no(tree.getroot())
+        day_profile_data = parser.extract_day_profile(tree.getroot(), meter_no)
+        transformed_data = build_day_profile_es_documents(day_profile_data)
+        return publish_to_es_helper(transformed_data, index_name=DAY_PROFILE_INDEX)
+    except ET.ParseError as e:
+        raise HTTPException(status_code=400, detail=f"XML Parse Error: {str(e)}")
+
+
+@app.post("/api/elasticsearch/dir/day-profile")
+def es_push_dir_day_profile(req: DirectoryRequest):
+    return publish_directory_data_to_es(
+        req, 
+        extractor=parser.extract_day_profile,
+        index_name=DAY_PROFILE_INDEX,
+        transformer=build_day_profile_es_documents,
+    )
+
+
+@app.post("/api/elasticsearch/day-profile/save-month-to-sql")
+def save_day_profile_month_from_es_to_sql(req: MeterDateRequest):
+    target_date = parse_request_date(req.date)
+    hits = fetch_day_profile_month_docs_from_es(req.meter_no, req.date)
+    rows = build_day_profile_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No day profile data found for the given meter no and month.",
+        )
+
+    affected_rows = save_day_profile_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "table": DB_DAY_PROFILE_TABLE,
+        "meter_no": req.meter_no,
+        "month": target_date.strftime("%m-%Y"),
+        "processed_rows": len(rows),
+        "affected_rows": affected_rows,
+    }
