@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
 from ...config import (
+    DB_BILLING_TABLE,
     DB_DAY_PROFILE_TABLE,
     DB_EVENT_PARAMETER_TABLE,
     DB_EVENT_TABLE,
@@ -9,6 +10,8 @@ from ...config import (
 )
 from ...models import LoadProfileExportRequest, MeterDateRequest
 from ...services.elasticsearch_service import (
+    fetch_billing_docs_from_es,
+    fetch_billing_month_docs_from_es,
     fetch_day_profile_month_docs_from_es,
     fetch_event_docs_from_es,
     fetch_event_month_docs_from_es,
@@ -17,9 +20,11 @@ from ...services.elasticsearch_service import (
     parse_request_date,
 )
 from ...services.sql_service import (
+    build_billing_sql_rows,
     build_day_profile_sql_rows,
     build_event_sql_rows,
     build_load_profile_sql_rows,
+    save_billing_rows_to_sql,
     save_day_profile_rows_to_sql,
     save_event_rows_to_sql,
     save_load_profile_rows_to_sql,
@@ -69,6 +74,53 @@ def save_load_profile_month_from_es_to_sql(req: LoadProfileExportRequest):
         "status": "success",
         "database": DB_NAME,
         "table": DB_LOAD_PROFILE_TABLE,
+        "meter_no": req.meter_no,
+        "month": target_date.strftime("%m-%Y"),
+        "processed_rows": len(rows),
+        "affected_rows": affected_rows,
+    }
+
+
+@router.post("/api/elasticsearch/billing/save-to-sql")
+def save_billing_from_es_to_sql(req: MeterDateRequest):
+    hits = fetch_billing_docs_from_es(req.meter_no, req.date)
+    rows = build_billing_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No billing data found for the given meter no and date.",
+        )
+
+    affected_rows = save_billing_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "table": DB_BILLING_TABLE,
+        "meter_no": req.meter_no,
+        "date": req.date,
+        "processed_rows": len(rows),
+        "affected_rows": affected_rows,
+    }
+
+
+@router.post("/api/elasticsearch/billing/save-month-to-sql")
+def save_billing_month_from_es_to_sql(req: MeterDateRequest):
+    target_date = parse_request_date(req.date)
+    hits = fetch_billing_month_docs_from_es(req.meter_no, req.date)
+    rows = build_billing_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No billing data found for the given meter no and month.",
+        )
+
+    affected_rows = save_billing_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "table": DB_BILLING_TABLE,
         "meter_no": req.meter_no,
         "month": target_date.strftime("%m-%Y"),
         "processed_rows": len(rows),

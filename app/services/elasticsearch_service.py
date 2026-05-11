@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from .. import parser
 from ..config import (
+    BILLING_INDEX,
     DB_LOAD_PROFILE_TABLE,
     ES_API_KEY,
     ES_ENDPOINT,
@@ -189,6 +190,70 @@ def fetch_event_month_docs_from_es(meter_no: str, date: str):
     try:
         response = es_client.search(
             index=EVENT_INDEX,
+            body={"size": 10000, "_source": source_fields, "query": query},
+        )
+        return response.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_billing_docs_from_es(meter_no: str, date: str):
+    target_date = parse_request_date(date)
+    hyphen_date_pattern = f"{target_date.strftime('%d-%m-%Y')}*"
+    slash_date_pattern = f"{target_date.strftime('%d/%m/%Y')}*"
+    source_fields = ["meter_no", "section", "date_time", "timestamp", "reset_method", "parameters"]
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {"meter_no.keyword": meter_no}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"date_time.keyword": {"value": hyphen_date_pattern}}},
+                            {"wildcard": {"date_time.keyword": {"value": slash_date_pattern}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=BILLING_INDEX,
+            body={"size": 5000, "_source": source_fields, "query": query},
+        )
+        return response.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_billing_month_docs_from_es(meter_no: str, date: str):
+    target_date = parse_request_date(date)
+    hyphen_month_pattern = f"*-{target_date.strftime('%m-%Y')}*"
+    slash_month_pattern = f"*/{target_date.strftime('%m/%Y')}*"
+    source_fields = ["meter_no", "section", "date_time", "timestamp", "reset_method", "parameters"]
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {"meter_no.keyword": meter_no}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"date_time.keyword": {"value": hyphen_month_pattern}}},
+                            {"wildcard": {"date_time.keyword": {"value": slash_month_pattern}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=BILLING_INDEX,
             body={"size": 10000, "_source": source_fields, "query": query},
         )
         return response.get("hits", {}).get("hits", [])

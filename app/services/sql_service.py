@@ -5,6 +5,7 @@ from fastapi import HTTPException
 
 from .. import parser
 from ..config import (
+    DB_BILLING_TABLE,
     DB_DAY_PROFILE_TABLE,
     DB_EVENT_PARAMETER_TABLE,
     DB_EVENT_TABLE,
@@ -312,6 +313,133 @@ def save_day_profile_rows_to_sql(rows: list):
             connection,
             DB_DAY_PROFILE_TABLE,
             [header for header in headers if header not in {"METER_NO", "DATETIME_TIMESTAMP"}],
+        )
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(insert_sql, values)
+            connection.commit()
+            return cursor.rowcount
+        finally:
+            cursor.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
+    finally:
+        connection.close()
+
+
+def _collect_billing_parameter_codes_from_hits(hits: list) -> list:
+    parameter_codes = set()
+    for hit in hits:
+        source = hit.get("_source", {})
+        for parameter in source.get("parameters", []):
+            code = str(parameter.get("code", "")).strip()
+            if code:
+                parameter_codes.add(code)
+    return sorted(parameter_codes)
+
+
+def build_billing_sql_rows(hits: list):
+    parameter_codes = _collect_billing_parameter_codes_from_hits(hits)
+    code_to_sql_column = get_parameter_mappings_for_table(DB_BILLING_TABLE, parameter_codes)
+    dynamic_columns = sorted({column_name for column_name in code_to_sql_column.values()})
+    rows = []
+
+    for hit in hits:
+        source = hit.get("_source", {})
+        row = {
+            "METER_NO": source.get("meter_no", ""),
+            "SECTION": source.get("section", ""),
+            "BILLING_DATE_TIME": source.get("timestamp", "") or parser.format_datetime_to_iso(source.get("date_time", "")),
+            "RESET_METHOD": source.get("reset_method", ""),
+        }
+        row.update({column_name: None for column_name in dynamic_columns})
+
+        for parameter in source.get("parameters", []):
+            code = parameter.get("code")
+            sql_column = code_to_sql_column.get(code)
+            if sql_column:
+                row[sql_column] = parameter.get("value", "")
+
+        rows.append(row)
+
+    return sorted(rows, key=lambda item: (item["BILLING_DATE_TIME"], item["SECTION"]))
+
+
+def get_billing_sql_headers(rows: list):
+    fixed_headers = ["METER_NO", "SECTION", "BILLING_DATE_TIME", "RESET_METHOD"]
+    dynamic_headers = sorted({key for row in rows for key in row.keys() if key not in fixed_headers})
+    return fixed_headers + dynamic_headers
+
+
+def prepare_billing_sql_value(column_name: str, value):
+    if column_name == "BILLING_DATE_TIME":
+        return prepare_load_profile_sql_value("DATETIME_TIMESTAMP", value)
+    if value in ("", None):
+        return None
+    return value
+
+
+def ensure_billing_sql_table_with_columns(connection, dynamic_columns: list):
+    fixed_columns = [
+        ("METER_NO", "VARCHAR(64) NOT NULL"),
+        ("SECTION", "VARCHAR(64) NOT NULL"),
+        ("BILLING_DATE_TIME", "DATETIME NOT NULL"),
+        ("RESET_METHOD", "VARCHAR(128) NULL"),
+    ]
+    fixed_column_defs = [
+        f"{quote_mysql_identifier(column_name)} {column_type}"
+        for column_name, column_type in fixed_columns
+    ]
+    primary_key = ", ".join(
+        quote_mysql_identifier(column_name) for column_name in ("METER_NO", "SECTION", "BILLING_DATE_TIME")
+    )
+    create_table_sql = (
+        f"CREATE TABLE IF NOT EXISTS {quote_mysql_identifier(DB_BILLING_TABLE)} "
+        f"({', '.join(fixed_column_defs)}, PRIMARY KEY ({primary_key}))"
+    )
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(create_table_sql)
+        cursor.execute(f"SHOW COLUMNS FROM {quote_mysql_identifier(DB_BILLING_TABLE)}")
+        existing_columns = {str(column[0]).upper() for column in cursor.fetchall()}
+        for column_name in dynamic_columns:
+            if column_name.upper() not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE {quote_mysql_identifier(DB_BILLING_TABLE)} "
+                    f"ADD COLUMN {quote_mysql_identifier(column_name)} DECIMAL(18,6) NULL"
+                )
+        connection.commit()
+    finally:
+        cursor.close()
+
+
+def save_billing_rows_to_sql(rows: list):
+    connection = get_mysql_connection()
+    headers = get_billing_sql_headers(rows)
+    quoted_columns = ", ".join(quote_mysql_identifier(header) for header in headers)
+    placeholders = ", ".join(["%s"] * len(headers))
+    update_clause = ", ".join(
+        f"{quote_mysql_identifier(header)} = VALUES({quote_mysql_identifier(header)})"
+        for header in headers
+        if header not in {"METER_NO", "SECTION", "BILLING_DATE_TIME"}
+    )
+    if not update_clause:
+        update_clause = f"{quote_mysql_identifier('METER_NO')} = VALUES({quote_mysql_identifier('METER_NO')})"
+    insert_sql = (
+        f"INSERT INTO {quote_mysql_identifier(DB_BILLING_TABLE)} ({quoted_columns}) "
+        f"VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_clause}"
+    )
+    values = [
+        tuple(prepare_billing_sql_value(header, row.get(header)) for header in headers)
+        for row in rows
+    ]
+
+    try:
+        ensure_billing_sql_table_with_columns(
+            connection,
+            [header for header in headers if header not in {"METER_NO", "SECTION", "BILLING_DATE_TIME", "RESET_METHOD"}],
         )
         cursor = connection.cursor()
         try:

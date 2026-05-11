@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from ... import parser
 from ...config import (
+    BILLING_INDEX,
     DAY_PROFILE_INDEX,
     EVENT_INDEX,
     LOAD_PROFILE_INDEX,
@@ -112,7 +113,7 @@ def es_push_billing(req: FileRequest):
         meter_no = parser.get_meter_no(tree.getroot())
         flat_data = parser.extract_billing(tree.getroot(), meter_no)
         transformed_data = build_billing_es_documents(flat_data)
-        return publish_to_es_helper(transformed_data, index_name="meter-billing-data")
+        return publish_to_es_helper(transformed_data, index_name=BILLING_INDEX)
     except ET.ParseError as exc:
         raise HTTPException(status_code=400, detail=f"XML Parse Error: {str(exc)}")
 
@@ -122,7 +123,7 @@ def es_push_dir_billing(req: DirectoryRequest):
     return publish_directory_data_to_es(
         directory_path=req.directory_path,
         extractor=parser.extract_billing,
-        index_name="meter-billing-data",
+        index_name=BILLING_INDEX,
         transformer=build_billing_es_documents,
     )
 
