@@ -201,7 +201,17 @@ def fetch_billing_docs_from_es(meter_no: str, date: str):
     target_date = parse_request_date(date)
     hyphen_date_pattern = f"{target_date.strftime('%d-%m-%Y')}*"
     slash_date_pattern = f"{target_date.strftime('%d/%m/%Y')}*"
-    source_fields = ["meter_no", "section", "date_time", "timestamp", "reset_method", "parameters"]
+    source_fields = [
+        "meter_no",
+        "section",
+        "date_time",
+        "timestamp",
+        "reset_method",
+        "power_on_duration",
+        "power_off_duration",
+        "cumulative_tamper_count",
+        "parameters",
+    ]
     query = {
         "bool": {
             "filter": [
@@ -233,7 +243,17 @@ def fetch_billing_month_docs_from_es(meter_no: str, date: str):
     target_date = parse_request_date(date)
     hyphen_month_pattern = f"*-{target_date.strftime('%m-%Y')}*"
     slash_month_pattern = f"*/{target_date.strftime('%m/%Y')}*"
-    source_fields = ["meter_no", "section", "date_time", "timestamp", "reset_method", "parameters"]
+    source_fields = [
+        "meter_no",
+        "section",
+        "date_time",
+        "timestamp",
+        "reset_method",
+        "power_on_duration",
+        "power_off_duration",
+        "cumulative_tamper_count",
+        "parameters",
+    ]
     query = {
         "bool": {
             "filter": [
@@ -259,6 +279,49 @@ def fetch_billing_month_docs_from_es(meter_no: str, date: str):
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+
+
+def fetch_all_billing_docs_from_es(meter_no: str):
+    source_fields = [
+        "meter_no",
+        "section",
+        "date_time",
+        "timestamp",
+        "reset_method",
+        "power_on_duration",
+        "power_off_duration",
+        "cumulative_tamper_count",
+        "parameters",
+    ]
+    query = {"bool": {"filter": [{"term": {"meter_no.keyword": meter_no}}]}}
+
+    scroll_id = None
+    all_hits = []
+    try:
+        response = es_client.search(
+            index=BILLING_INDEX,
+            body={"size": 1000, "_source": source_fields, "query": query},
+            scroll="2m",
+        )
+        scroll_id = response.get("_scroll_id")
+        hits = response.get("hits", {}).get("hits", [])
+        all_hits.extend(hits)
+
+        while hits:
+            response = es_client.scroll(scroll_id=scroll_id, scroll="2m")
+            scroll_id = response.get("_scroll_id", scroll_id)
+            hits = response.get("hits", {}).get("hits", [])
+            all_hits.extend(hits)
+
+        return all_hits
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+    finally:
+        if scroll_id:
+            try:
+                es_client.clear_scroll(scroll_id=scroll_id)
+            except Exception:
+                pass
 
 
 def build_load_profile_export_rows(hits: list):
@@ -331,7 +394,18 @@ def build_load_profile_es_documents(flat_data: list):
 
 def build_billing_es_documents(flat_data: list):
     grouped_docs = {}
-    base_keys = {"meter_no", "section", "date_time", "timestamp", "reset_method"}
+    base_keys = {
+        "meter_no",
+        "section",
+        "date_time",
+        "timestamp",
+        "reset_method",
+        "power_on_duration",
+        "power_off_duration",
+        "cumulative_tamper_count",
+    }
+    parameter_excluded_keys = {key.lower() for key in base_keys}
+    parameter_excluded_keys.update({"b11", "b12", "b13", "b11_name", "b12_name", "b13_name"})
 
     for row in flat_data:
         meter_no = row.get("meter_no", "")
@@ -350,10 +424,17 @@ def build_billing_es_documents(flat_data: list):
                 "date_time": date_time,
                 "timestamp": timestamp,
                 "reset_method": reset_method,
+                "power_on_duration": row.get("power_on_duration", ""),
+                "power_off_duration": row.get("power_off_duration", ""),
+                "cumulative_tamper_count": row.get("cumulative_tamper_count", ""),
                 "parameters": [],
             }
 
-        parameter = {key: value for key, value in row.items() if key not in base_keys and value not in (None, "")}
+        parameter = {
+            key: value
+            for key, value in row.items()
+            if key.lower() not in parameter_excluded_keys and value not in (None, "")
+        }
         grouped_docs[doc_key]["parameters"].append(parameter)
 
     return list(grouped_docs.values())

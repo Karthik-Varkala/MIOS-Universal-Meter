@@ -155,11 +155,22 @@ def extract_billing(root, meter_no):
         for sub in d3:
             dt = sub.get("DATETIME")
             reset_method = sub.get("MECHANISM", "")
+            billing_lookup = {}
 
             if not reset_method:
                 b2 = sub.find("B2")
                 if b2 is not None:
                     reset_method = b2.get("MECHANISM", "")
+
+            for child in sub:
+                child_tag = child.tag.upper()
+                billing_lookup[child_tag] = child.get("VALUE", "")
+
+            top_level_fields = {
+                "power_on_duration": billing_lookup.get("B11", ""),
+                "power_off_duration": billing_lookup.get("B12", ""),
+                "cumulative_tamper_count": billing_lookup.get("B13", ""),
+            }
 
             for b_tag in sub:
                 if b_tag.tag not in ["B2", "B5"]:
@@ -172,6 +183,7 @@ def extract_billing(root, meter_no):
                     "timestamp": format_datetime_to_iso(dt),
                     "reset_method": reset_method,
                 }
+                row.update(top_level_fields)
                 row.update(normalize_billing_tag_data(b_tag))
                 data.append(row)
 

@@ -346,11 +346,44 @@ def build_billing_sql_rows(hits: list):
 
     for hit in hits:
         source = hit.get("_source", {})
+        fallback_from_parameters = {}
+        for parameter in source.get("parameters", []):
+            if not isinstance(parameter, dict):
+                continue
+            for key in (
+                "b11",
+                "b12",
+                "b13",
+                "power_on_duration",
+                "power_off_duration",
+                "cumulative_tamper_count",
+            ):
+                if key not in fallback_from_parameters and parameter.get(key) not in ("", None):
+                    fallback_from_parameters[key] = parameter.get(key)
+
         row = {
             "METER_NO": source.get("meter_no", ""),
             "SECTION": source.get("section", ""),
             "BILLING_DATE_TIME": source.get("timestamp", "") or parser.format_datetime_to_iso(source.get("date_time", "")),
             "RESET_METHOD": source.get("reset_method", ""),
+            "POWER_ON_DURATION": (
+                source.get("power_on_duration", "")
+                or source.get("b11", "")
+                or fallback_from_parameters.get("power_on_duration", "")
+                or fallback_from_parameters.get("b11", "")
+            ),
+            "POWER_OFF_DURATION": (
+                source.get("power_off_duration", "")
+                or source.get("b12", "")
+                or fallback_from_parameters.get("power_off_duration", "")
+                or fallback_from_parameters.get("b12", "")
+            ),
+            "CUMULATIVE_TAMPER_COUNT": (
+                source.get("cumulative_tamper_count", "")
+                or source.get("b13", "")
+                or fallback_from_parameters.get("cumulative_tamper_count", "")
+                or fallback_from_parameters.get("b13", "")
+            ),
         }
         row.update({column_name: None for column_name in dynamic_columns})
 
@@ -405,9 +438,11 @@ def ensure_billing_sql_table_with_columns(connection, dynamic_columns: list):
         existing_columns = {str(column[0]).upper() for column in cursor.fetchall()}
         for column_name in dynamic_columns:
             if column_name.upper() not in existing_columns:
+                is_text_column = column_name.upper().endswith("_NAME")
+                column_type = "VARCHAR(255) NULL" if is_text_column else "DECIMAL(18,6) NULL"
                 cursor.execute(
                     f"ALTER TABLE {quote_mysql_identifier(DB_BILLING_TABLE)} "
-                    f"ADD COLUMN {quote_mysql_identifier(column_name)} DECIMAL(18,6) NULL"
+                    f"ADD COLUMN {quote_mysql_identifier(column_name)} {column_type}"
                 )
         connection.commit()
     finally:

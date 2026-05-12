@@ -22,6 +22,10 @@ class LoadProfileExportRequest(BaseModel):
     date: str
 
 
+class MeterRequest(BaseModel):
+    meter_no: str
+
+
 class MeterDateRequest(BaseModel):
     meter_no: str
     date: str

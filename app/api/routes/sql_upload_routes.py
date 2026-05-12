@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException
 
 from ...config import (
@@ -8,8 +10,9 @@ from ...config import (
     DB_LOAD_PROFILE_TABLE,
     DB_NAME,
 )
-from ...models import LoadProfileExportRequest, MeterDateRequest
+from ...models import LoadProfileExportRequest, MeterDateRequest, MeterRequest
 from ...services.elasticsearch_service import (
+    fetch_all_billing_docs_from_es,
     fetch_billing_docs_from_es,
     fetch_billing_month_docs_from_es,
     fetch_day_profile_month_docs_from_es,
@@ -32,6 +35,32 @@ from ...services.sql_service import (
 
 
 router = APIRouter()
+
+
+def _extract_billing_month_label(source: dict) -> str:
+    timestamp = str(source.get("timestamp", "") or "").strip()
+    if timestamp:
+        try:
+            return parse_request_date(timestamp[:10]).strftime("%m-%Y")
+        except HTTPException:
+            pass
+        except Exception:
+            pass
+
+    date_time = str(source.get("date_time", "") or "").strip()
+    for datetime_format in (
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S:%f",
+        "%d/%m/%Y %H:%M:%S:%f",
+    ):
+        try:
+            return datetime.strptime(date_time, datetime_format).strftime("%m-%Y")
+        except ValueError:
+            continue
+    return ""
 
 
 @router.post("/api/elasticsearch/load-profile/save-to-sql")
@@ -123,6 +152,37 @@ def save_billing_month_from_es_to_sql(req: MeterDateRequest):
         "table": DB_BILLING_TABLE,
         "meter_no": req.meter_no,
         "month": target_date.strftime("%m-%Y"),
+        "processed_rows": len(rows),
+        "affected_rows": affected_rows,
+    }
+
+
+@router.post("/api/elasticsearch/billing/save-all-months-to-sql")
+def save_billing_all_months_from_es_to_sql(req: MeterRequest):
+    hits = fetch_all_billing_docs_from_es(req.meter_no)
+    rows = build_billing_sql_rows(hits)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No billing data found for the given meter no.",
+        )
+
+    available_months = sorted(
+        {
+            month_label
+            for hit in hits
+            for month_label in [_extract_billing_month_label(hit.get("_source", {}))]
+            if month_label
+        }
+    )
+    affected_rows = save_billing_rows_to_sql(rows)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "table": DB_BILLING_TABLE,
+        "meter_no": req.meter_no,
+        "available_months": available_months,
         "processed_rows": len(rows),
         "affected_rows": affected_rows,
     }
