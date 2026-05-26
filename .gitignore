@@ -13,3 +13,4 @@ env/
 S3files/
 *.cdf
 *.csv
+logs/

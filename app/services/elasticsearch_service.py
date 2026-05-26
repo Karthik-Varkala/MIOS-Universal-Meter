@@ -1,5 +1,4 @@
 import os
-import xml.etree.ElementTree as ET
 from datetime import datetime
 
 from elasticsearch import Elasticsearch, helpers
@@ -16,12 +15,15 @@ from ..config import (
     LOAD_PROFILE_CORE_HEADERS,
     LOAD_PROFILE_INDEX,
 )
+from ..logging_utils import get_logger, log_exception
 from .sql_service import get_parameter_mappings_for_table
+from ..validation import log_processing_failure, parse_cdf_xml, require_meter_no
 
 es_client = Elasticsearch(
     ES_ENDPOINT,
     api_key=ES_API_KEY,
 )
+logger = get_logger(__name__)
 
 
 def publish_to_es_helper(data: list, index_name: str):
@@ -41,6 +43,7 @@ def publish_to_es_helper(data: list, index_name: str):
         success, _ = helpers.bulk(es_client, actions)
         return {"message": f"Successfully inserted {success} records into {index_name}"}
     except Exception as exc:
+        log_exception(logger, "Elasticsearch bulk insert failed", exc, index_name=index_name, record_count=len(data))
         raise HTTPException(status_code=500, detail=f"Elasticsearch Bulk Insert Error: {str(exc)}")
 
 
@@ -75,6 +78,7 @@ def fetch_load_profile_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=LOAD_PROFILE_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -98,6 +102,7 @@ def fetch_load_profile_month_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=LOAD_PROFILE_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -130,6 +135,7 @@ def fetch_day_profile_month_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=DAY_PROFILE_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -162,6 +168,7 @@ def fetch_event_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=EVENT_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -194,6 +201,7 @@ def fetch_event_month_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=EVENT_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -236,6 +244,7 @@ def fetch_billing_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=BILLING_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -278,6 +287,7 @@ def fetch_billing_month_docs_from_es(meter_no: str, date: str):
         )
         return response.get("hits", {}).get("hits", [])
     except Exception as exc:
+        log_exception(logger, "Elasticsearch search failed", exc, index_name=BILLING_INDEX, meter_no=meter_no, date=date)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
 
 
@@ -315,6 +325,7 @@ def fetch_all_billing_docs_from_es(meter_no: str):
 
         return all_hits
     except Exception as exc:
+        log_exception(logger, "Elasticsearch scroll search failed", exc, index_name=BILLING_INDEX, meter_no=meter_no)
         raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
     finally:
         if scroll_id:
@@ -485,21 +496,22 @@ def build_day_profile_es_documents(day_profile_data: list):
 def publish_directory_data_to_es(directory_path: str, extractor, index_name: str, transformer=None):
     all_data = []
     processed_files = 0
-    skipped_files = 0
+    failed_files = []
     files = parser.get_cdf_files(directory_path)
 
     for file in files:
         file_path = os.path.join(directory_path, file)
         try:
-            tree = ET.parse(file_path)
-            meter_no = parser.get_meter_no(tree.getroot())
-            data = extractor(tree.getroot(), meter_no)
+            tree = parse_cdf_xml(file_path)
+            root = tree.getroot()
+            meter_no = require_meter_no(root, file_path=file_path, operation="publish_directory_data_to_es")
+            data = extractor(root, meter_no, file_path=file_path)
             if transformer:
                 data = transformer(data)
             all_data.extend(data)
             processed_files += 1
-        except ET.ParseError:
-            skipped_files += 1
+        except Exception as exc:
+            failed_files.append(log_processing_failure(file_path, "publish_directory_data_to_es", exc))
             continue
 
     if all_data:
@@ -511,7 +523,8 @@ def publish_directory_data_to_es(directory_path: str, extractor, index_name: str
         "status": "success",
         "directory_path": directory_path,
         "processed_files": processed_files,
-        "skipped_files": skipped_files,
+        "skipped_files": len(failed_files),
+        "failed_files": failed_files,
         "total_records": len(all_data),
         "elasticsearch": es_result,
     }

@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
+from .logging_utils import append_invalid_record
+from .validation import ensure_records_present, require_xml_attribute, require_xml_section
+
 
 def get_cdf_files(directory_path: str):
     if not os.path.isdir(directory_path):
@@ -19,23 +22,35 @@ def get_meter_no(root):
     if d1 is not None:
         g1 = d1.find("G1")
         if g1 is not None and g1.text:
-            return g1.text
+            return str(g1.text).strip()
     return "Unknown"
 
 
-def extract_instantaneous(root, meter_no):
+def _raise_data_validation_error(message: str, operation: str, file_path: str = "", **context):
+    append_invalid_record(message, operation=operation, file_path=file_path, **context)
+    raise HTTPException(status_code=400, detail=message)
+
+
+def extract_instantaneous(root, meter_no, file_path: str = ""):
     data = []
-    d2 = root.find(".//D2")
-    if d2 is not None:
-        for param in d2.findall("INSTPARAM"):
-            data.append(
-                {
-                    "meter_no": meter_no,
-                    "code": param.get("CODE"),
-                    "value": param.get("VALUE"),
-                    "unit": param.get("UNIT"),
-                }
-            )
+    d2 = require_xml_section(root, "D2", operation="extract_instantaneous", file_path=file_path)
+    for index, param in enumerate(d2.findall("INSTPARAM"), start=1):
+        code = require_xml_attribute(
+            param,
+            "CODE",
+            operation="extract_instantaneous",
+            file_path=file_path,
+            element_name=f"INSTPARAM[{index}]",
+        )
+        data.append(
+            {
+                "meter_no": meter_no,
+                "code": code,
+                "value": param.get("VALUE", ""),
+                "unit": param.get("UNIT", ""),
+            }
+        )
+    ensure_records_present(data, operation="extract_instantaneous", record_type="instantaneous", file_path=file_path)
     return data
 
 
@@ -127,82 +142,172 @@ def normalize_billing_tag_data(b_tag):
     return normalized_data
 
 
-def extract_load_profile(root, meter_no):
+def extract_load_profile(root, meter_no, file_path: str = ""):
     data = []
-    d4 = root.find(".//D4")
+    d4 = require_xml_section(root, "D4", operation="extract_load_profile", file_path=file_path)
     interval_period = get_load_profile_interval_period(root)
-    if d4 is not None:
-        for day_profile in d4.findall("DAYPROFILE"):
-            date = day_profile.get("DATE")
-            for ip in day_profile.findall("IP"):
-                interval = ip.get("INTERVAL")
-                row = {
-                    "meter_no": meter_no,
-                    "date": date,
-                    "interval": interval,
-                    "timestamp": get_timestamp(date, interval_period, interval),
-                }
-                for param in ip.findall("PARAMETER"):
-                    row[param.get("PARAMCODE")] = param.get("VALUE")
-                data.append(row)
-    return data
+    if interval_period is None:
+        _raise_data_validation_error(
+            "Missing or invalid D4.INTERVALPERIOD value.",
+            operation="extract_load_profile",
+            file_path=file_path,
+            section="D4",
+        )
 
+    for day_index, day_profile in enumerate(d4.findall("DAYPROFILE"), start=1):
+        date = require_xml_attribute(
+            day_profile,
+            "DATE",
+            operation="extract_load_profile",
+            file_path=file_path,
+            element_name=f"DAYPROFILE[{day_index}]",
+        )
+        for interval_index, ip in enumerate(day_profile.findall("IP"), start=1):
+            interval = require_xml_attribute(
+                ip,
+                "INTERVAL",
+                operation="extract_load_profile",
+                file_path=file_path,
+                element_name=f"IP[{interval_index}]",
+            )
+            timestamp = get_timestamp(date, interval_period, interval)
+            if not timestamp:
+                _raise_data_validation_error(
+                    "Unable to build timestamp from DATE, INTERVALPERIOD, and INTERVAL.",
+                    operation="extract_load_profile",
+                    file_path=file_path,
+                    date=date,
+                    interval=interval,
+                    interval_period=interval_period,
+                )
 
-def extract_billing(root, meter_no):
-    data = []
-    d3 = root.find(".//D3")
-    if d3 is not None:
-        for sub in d3:
-            dt = sub.get("DATETIME")
-            reset_method = sub.get("MECHANISM", "")
-            billing_lookup = {}
-
-            if not reset_method:
-                b2 = sub.find("B2")
-                if b2 is not None:
-                    reset_method = b2.get("MECHANISM", "")
-
-            for child in sub:
-                child_tag = child.tag.upper()
-                billing_lookup[child_tag] = child.get("VALUE", "")
-
-            top_level_fields = {
-                "power_on_duration": billing_lookup.get("B11", ""),
-                "power_off_duration": billing_lookup.get("B12", ""),
-                "cumulative_tamper_count": billing_lookup.get("B13", ""),
+            row = {
+                "meter_no": meter_no,
+                "date": date,
+                "interval": interval,
+                "timestamp": timestamp,
             }
-
-            for b_tag in sub:
-                if b_tag.tag not in ["B2", "B5"]:
-                    continue
-
-                row = {
-                    "meter_no": meter_no,
-                    "section": sub.tag,
-                    "date_time": dt,
-                    "timestamp": format_datetime_to_iso(dt),
-                    "reset_method": reset_method,
-                }
-                row.update(top_level_fields)
-                row.update(normalize_billing_tag_data(b_tag))
-                data.append(row)
-
+            for parameter_index, param in enumerate(ip.findall("PARAMETER"), start=1):
+                parameter_code = require_xml_attribute(
+                    param,
+                    "PARAMCODE",
+                    operation="extract_load_profile",
+                    file_path=file_path,
+                    element_name=f"PARAMETER[{parameter_index}]",
+                )
+                row[parameter_code] = param.get("VALUE", "")
+            data.append(row)
+    ensure_records_present(data, operation="extract_load_profile", record_type="load profile", file_path=file_path)
     return data
 
 
-def extract_events(root, meter_no):
+def extract_billing(root, meter_no, file_path: str = ""):
     data = []
+    d3 = require_xml_section(root, "D3", operation="extract_billing", file_path=file_path)
+    for section_index, sub in enumerate(d3, start=1):
+        dt = require_xml_attribute(
+            sub,
+            "DATETIME",
+            operation="extract_billing",
+            file_path=file_path,
+            element_name=f"{sub.tag}[{section_index}]",
+        )
+        timestamp = format_datetime_to_iso(dt)
+        if not timestamp:
+            _raise_data_validation_error(
+                "Invalid billing DATETIME format.",
+                operation="extract_billing",
+                file_path=file_path,
+                billing_datetime=dt,
+            )
 
-    for event_index, event in enumerate(root.findall(".//D5/EVENT"), start=1):
-        event_time = event.get("TIME", "")
+        reset_method = sub.get("MECHANISM", "")
+        billing_lookup = {}
+
+        if not reset_method:
+            b2 = sub.find("B2")
+            if b2 is not None:
+                reset_method = b2.get("MECHANISM", "")
+
+        for child in sub:
+            child_tag = child.tag.upper()
+            billing_lookup[child_tag] = child.get("VALUE", "")
+
+        top_level_fields = {
+            "power_on_duration": billing_lookup.get("B11", ""),
+            "power_off_duration": billing_lookup.get("B12", ""),
+            "cumulative_tamper_count": billing_lookup.get("B13", ""),
+        }
+
+        for billing_index, b_tag in enumerate(sub, start=1):
+            if b_tag.tag not in ["B2", "B5"]:
+                continue
+
+            if not (b_tag.get("PARAMCODE") or b_tag.get("CODE")):
+                _raise_data_validation_error(
+                    "Missing billing parameter code in B2/B5 tag.",
+                    operation="extract_billing",
+                    file_path=file_path,
+                    section=sub.tag,
+                    element=f"{b_tag.tag}[{billing_index}]",
+                )
+
+            row = {
+                "meter_no": meter_no,
+                "section": sub.tag,
+                "date_time": dt,
+                "timestamp": timestamp,
+                "reset_method": reset_method,
+            }
+            row.update(top_level_fields)
+            row.update(normalize_billing_tag_data(b_tag))
+            data.append(row)
+
+    ensure_records_present(data, operation="extract_billing", record_type="billing", file_path=file_path)
+    return data
+
+
+def extract_events(root, meter_no, file_path: str = ""):
+    data = []
+    d5 = require_xml_section(root, "D5", operation="extract_events", file_path=file_path)
+
+    for event_index, event in enumerate(d5.findall("EVENT"), start=1):
+        event_time = require_xml_attribute(
+            event,
+            "TIME",
+            operation="extract_events",
+            file_path=file_path,
+            element_name=f"EVENT[{event_index}]",
+        )
+        timestamp = format_datetime_to_iso(event_time)
+        if not timestamp:
+            _raise_data_validation_error(
+                "Invalid event TIME format.",
+                operation="extract_events",
+                file_path=file_path,
+                event_time=event_time,
+                event_index=event_index,
+            )
         row = {
             "meter_no": meter_no,
             "event_index": event_index,
-            "code": event.get("CODE", ""),
+            "code": require_xml_attribute(
+                event,
+                "CODE",
+                operation="extract_events",
+                file_path=file_path,
+                element_name=f"EVENT[{event_index}]",
+            ),
             "status": event.get("STATUS", ""),
-            "logid": event.get("LOGID", ""),
+            "logid": require_xml_attribute(
+                event,
+                "LOGID",
+                operation="extract_events",
+                file_path=file_path,
+                element_name=f"EVENT[{event_index}]",
+            ),
             "time": event_time,
-            "timestamp": format_datetime_to_iso(event_time),
+            "timestamp": timestamp,
             "parameters": [],
         }
 
@@ -210,7 +315,13 @@ def extract_events(root, meter_no):
             row["parameters"].append(
                 {
                     "parameter_index": parameter_index,
-                    "code": snapshot.get("PARAMCODE", ""),
+                    "code": require_xml_attribute(
+                        snapshot,
+                        "PARAMCODE",
+                        operation="extract_events",
+                        file_path=file_path,
+                        element_name=f"SNAPSHOT[{parameter_index}]",
+                    ),
                     "value": snapshot.get("VALUE", ""),
                     "unit": snapshot.get("UNIT", ""),
                 }
@@ -218,29 +329,48 @@ def extract_events(root, meter_no):
 
         data.append(row)
 
+    ensure_records_present(data, operation="extract_events", record_type="event", file_path=file_path)
     return data
 
 
-def extract_day_profile(root, meter_no):
+def extract_day_profile(root, meter_no, file_path: str = ""):
     data = []
-    d6 = root.find(".//D6")
+    d6 = require_xml_section(root, "D6", operation="extract_day_profile", file_path=file_path)
 
-    if d6 is None:
-        return data
-
-    for snapshot in d6.findall("SNAPSHOT"):
-        snapshot_datetime = snapshot.get("DATETIME", "")
+    for snapshot_index, snapshot in enumerate(d6.findall("SNAPSHOT"), start=1):
+        snapshot_datetime = require_xml_attribute(
+            snapshot,
+            "DATETIME",
+            operation="extract_day_profile",
+            file_path=file_path,
+            element_name=f"SNAPSHOT[{snapshot_index}]",
+        )
+        timestamp = format_datetime_to_iso(snapshot_datetime)
+        if not timestamp:
+            _raise_data_validation_error(
+                "Invalid day profile DATETIME format.",
+                operation="extract_day_profile",
+                file_path=file_path,
+                snapshot_datetime=snapshot_datetime,
+                snapshot_index=snapshot_index,
+            )
         row = {
             "meter_no": meter_no,
             "datetime": snapshot_datetime,
-            "timestamp": format_datetime_to_iso(snapshot_datetime),
+            "timestamp": timestamp,
             "parameters": [],
         }
 
-        for register in snapshot.findall("REGISTER"):
+        for register_index, register in enumerate(snapshot.findall("REGISTER"), start=1):
             row["parameters"].append(
                 {
-                    "code": register.get("PARAMCODE", ""),
+                    "code": require_xml_attribute(
+                        register,
+                        "PARAMCODE",
+                        operation="extract_day_profile",
+                        file_path=file_path,
+                        element_name=f"REGISTER[{register_index}]",
+                    ),
                     "value": register.get("VALUE", ""),
                     "unit": register.get("UNIT", ""),
                 }
@@ -248,6 +378,7 @@ def extract_day_profile(root, meter_no):
 
         data.append(row)
 
+    ensure_records_present(data, operation="extract_day_profile", record_type="day profile", file_path=file_path)
     return data
 
 

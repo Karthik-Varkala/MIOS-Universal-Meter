@@ -18,6 +18,10 @@ from ..config import (
     DB_USER,
     EVENT_SQL_UNIQUE_KEY_COLUMNS,
 )
+from ..logging_utils import get_logger, log_exception
+
+
+logger = get_logger(__name__)
 
 
 def quote_mysql_identifier(identifier: str) -> str:
@@ -61,6 +65,7 @@ def get_mysql_connection():
         cursor.close()
         return connection
     except Exception as exc:
+        log_exception(logger, "MySQL connection failed", exc, database=DB_NAME, host=DB_HOST, port=DB_PORT)
         raise HTTPException(status_code=500, detail=f"MySQL Connection Error: {str(exc)}")
 
 
@@ -267,6 +272,7 @@ def save_load_profile_rows_to_sql(rows: list):
         finally:
             cursor.close()
     except Exception as exc:
+        log_exception(logger, "MySQL load profile insert failed", exc, table=DB_LOAD_PROFILE_TABLE, row_count=len(rows))
         raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
     finally:
         connection.close()
@@ -322,6 +328,7 @@ def save_day_profile_rows_to_sql(rows: list):
         finally:
             cursor.close()
     except Exception as exc:
+        log_exception(logger, "MySQL day profile insert failed", exc, table=DB_DAY_PROFILE_TABLE, row_count=len(rows))
         raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
     finally:
         connection.close()
@@ -484,6 +491,7 @@ def save_billing_rows_to_sql(rows: list):
         finally:
             cursor.close()
     except Exception as exc:
+        log_exception(logger, "MySQL billing insert failed", exc, table=DB_BILLING_TABLE, row_count=len(rows))
         raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
     finally:
         connection.close()
@@ -707,6 +715,14 @@ def save_event_rows_to_sql(rows: list):
             cursor.close()
     except Exception as exc:
         connection.rollback()
+        log_exception(
+            logger,
+            "MySQL event insert failed",
+            exc,
+            event_table=DB_EVENT_TABLE,
+            event_parameter_table=DB_EVENT_PARAMETER_TABLE,
+            row_count=len(rows),
+        )
         raise HTTPException(status_code=500, detail=f"MySQL Insert Error: {str(exc)}")
     finally:
         connection.close()
