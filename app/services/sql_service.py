@@ -24,6 +24,56 @@ from ..logging_utils import get_logger, log_exception
 logger = get_logger(__name__)
 
 
+DEFAULT_PARAMETER_MAPPINGS = (
+    (DB_LOAD_PROFILE_TABLE, "P2-1-1-4-0", "CURRENT_R"),
+    (DB_LOAD_PROFILE_TABLE, "P2-1-2-4-0", "CURRENT_Y"),
+    (DB_LOAD_PROFILE_TABLE, "P2-1-3-4-0", "CURRENT_B"),
+    (DB_LOAD_PROFILE_TABLE, "P1-2-1-4-0", "VOLTAGE_R"),
+    (DB_LOAD_PROFILE_TABLE, "P1-2-2-4-0", "VOLTAGE_Y"),
+    (DB_LOAD_PROFILE_TABLE, "P1-2-3-4-0", "VOLTAGE_B"),
+    (DB_LOAD_PROFILE_TABLE, "P7-1-18-1-0", "KWH"),
+    (DB_LOAD_PROFILE_TABLE, "P7-1-18-2-0", "KWH"),
+    (DB_LOAD_PROFILE_TABLE, "P7-3-18-2-0", "KVAH_IMPORT"),
+    (DB_LOAD_PROFILE_TABLE, "P7-2-1-0-0", "KVARH_LAG"),
+    (DB_LOAD_PROFILE_TABLE, "P7-2-2-0-0", "KVARH_LEAD"),
+    (DB_LOAD_PROFILE_TABLE, "P7-2-19-0-0", "KVARH_REACTIVE_LAG"),
+    (DB_LOAD_PROFILE_TABLE, "P7-2-20-0-0", "KVARH_REACTIVE_LEAD"),
+    (DB_DAY_PROFILE_TABLE, "P7-1-18-2-0", "KWH_FORWARDED_TOTAL"),
+    (DB_DAY_PROFILE_TABLE, "P7-1-18-1-0", "KWH_FORWARDED_FUND"),
+    (DB_DAY_PROFILE_TABLE, "P7-1-5-1-0", "KWH_IMPORT_FUND"),
+    (DB_DAY_PROFILE_TABLE, "P7-1-6-2-0", "KWH_EXPORT_TOTAL"),
+    (DB_DAY_PROFILE_TABLE, "P7-1-6-1-0", "KWH_EXPORT_FUND"),
+    (DB_DAY_PROFILE_TABLE, "P7-3-18-2-0", "KVAH_FORWARDED_TOTAL"),
+    (DB_DAY_PROFILE_TABLE, "P7-3-5-2-0", "KVAH_IMPORT_TOTAL"),
+    (DB_DAY_PROFILE_TABLE, "P7-3-6-0-0", "KVAH_EXPORT_TOTAL"),
+    (DB_DAY_PROFILE_TABLE, "P7-2-1-0-0", "KVARH_Q1_LAG"),
+    (DB_DAY_PROFILE_TABLE, "P7-2-2-0-0", "KVARH_Q2_LEAD"),
+    (DB_DAY_PROFILE_TABLE, "P7-2-3-0-0", "KVARH_Q3"),
+    (DB_DAY_PROFILE_TABLE, "P7-2-4-0-0", "KVARH_Q4"),
+    (DB_DAY_PROFILE_TABLE, "P1202-1-5-2-0", "KWH_IMPORT_TOTAL_SNAPSHOT"),
+    (DB_DAY_PROFILE_TABLE, "P1203-1-14-1-0", "KWH_FORWARDED_FUND_SNAPSHOT"),
+    (DB_DAY_PROFILE_TABLE, "P1202-2-19-0-0", "KVARH_Q1_SNAPSHOT"),
+    (DB_DAY_PROFILE_TABLE, "P1202-2-20-0-0", "KVARH_Q4_SNAPSHOT"),
+)
+
+
+PARAMETER_COLUMN_PRIORITIES = {
+    (DB_LOAD_PROFILE_TABLE, "KWH"): {
+        "P7-1-18-1-0": 1,
+        "P7-1-18-2-0": 2,
+    },
+}
+
+PROFILE_COLUMN_ALIASES = {
+    DB_LOAD_PROFILE_TABLE: {
+        "KWH": ("KWH_IMPORT",),
+        "KVAH_IMPORT": ("KVAH", "POWER"),
+        "KVARH_REACTIVE_LAG": ("P7_2_19_0_0",),
+        "KVARH_REACTIVE_LEAD": ("P7_2_20_0_0",),
+    },
+}
+
+
 def quote_mysql_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
@@ -86,6 +136,22 @@ def ensure_parameter_mapping_table(connection):
         cursor.close()
 
 
+def seed_default_parameter_mappings(connection):
+    ensure_parameter_mapping_table(connection)
+    cursor = connection.cursor()
+    try:
+        cursor.executemany(
+            f"INSERT INTO {quote_mysql_identifier(DB_PARAMETER_MAPPING_TABLE)} "
+            f"({quote_mysql_identifier('TABLE_NAME')}, {quote_mysql_identifier('PARAMETER_CODE')}, {quote_mysql_identifier('COLUMN_NAME')}) "
+            f"VALUES (%s, %s, %s) "
+            f"ON DUPLICATE KEY UPDATE {quote_mysql_identifier('COLUMN_NAME')} = VALUES({quote_mysql_identifier('COLUMN_NAME')})",
+            DEFAULT_PARAMETER_MAPPINGS,
+        )
+        connection.commit()
+    finally:
+        cursor.close()
+
+
 def normalize_parameter_code_to_column_name(parameter_code: str) -> str:
     normalized = re.sub(r"[^0-9A-Za-z_]+", "_", str(parameter_code or "").strip())
     normalized = re.sub(r"_+", "_", normalized).strip("_")
@@ -108,7 +174,7 @@ def _collect_parameter_codes_from_hits(hits: list) -> list:
 
 
 def ensure_parameter_mappings_for_table(connection, table_name: str, parameter_codes: list):
-    ensure_parameter_mapping_table(connection)
+    seed_default_parameter_mappings(connection)
     cursor = connection.cursor()
     try:
         cursor.execute(
@@ -161,6 +227,35 @@ def get_parameter_mappings_for_table(table_name: str, parameter_codes: list = No
         connection.close()
 
 
+def get_parameter_column_priority(table_name: str, column_name: str, parameter_code: str) -> int:
+    column_priorities = PARAMETER_COLUMN_PRIORITIES.get((table_name, str(column_name or "").upper()), {})
+    return column_priorities.get(parameter_code, 100)
+
+
+def merge_profile_column_aliases(connection, target_table: str, existing_columns: set[str]):
+    alias_map = PROFILE_COLUMN_ALIASES.get(target_table, {})
+    if not alias_map:
+        return
+
+    cursor = connection.cursor()
+    try:
+        for target_column, alias_columns in alias_map.items():
+            if target_column.upper() not in existing_columns:
+                continue
+            for alias_column in alias_columns:
+                if alias_column.upper() not in existing_columns:
+                    continue
+                cursor.execute(
+                    f"UPDATE {quote_mysql_identifier(target_table)} "
+                    f"SET {quote_mysql_identifier(target_column)} = {quote_mysql_identifier(alias_column)} "
+                    f"WHERE {quote_mysql_identifier(target_column)} IS NULL "
+                    f"AND {quote_mysql_identifier(alias_column)} IS NOT NULL"
+                )
+        connection.commit()
+    finally:
+        cursor.close()
+
+
 def ensure_profile_sql_table_with_columns(connection, target_table: str, parameter_columns: list):
     fixed_columns = [("METER_NO", "VARCHAR(64) NOT NULL"), ("DATETIME_TIMESTAMP", "DATETIME NOT NULL")]
     fixed_column_defs = [
@@ -184,9 +279,12 @@ def ensure_profile_sql_table_with_columns(connection, target_table: str, paramet
                     f"ALTER TABLE {quote_mysql_identifier(target_table)} "
                     f"ADD COLUMN {quote_mysql_identifier(column_name)} DECIMAL(18,6) NULL"
                 )
+                existing_columns.add(column_name.upper())
         connection.commit()
     finally:
         cursor.close()
+
+    merge_profile_column_aliases(connection, target_table, existing_columns)
 
 
 def build_profile_sql_rows(hits: list, target_table: str):
@@ -207,7 +305,15 @@ def build_profile_sql_rows(hits: list, target_table: str):
             code = parameter.get("code")
             sql_column = code_to_sql_column.get(code)
             if sql_column:
+                selected_priorities = row.setdefault("_PARAMETER_PRIORITIES", {})
+                new_priority = get_parameter_column_priority(target_table, sql_column, code)
+                current_priority = selected_priorities.get(sql_column, 100)
+                if row.get(sql_column) not in ("", None) and new_priority >= current_priority:
+                    continue
                 row[sql_column] = parameter.get("value", "")
+                selected_priorities[sql_column] = new_priority
+
+        row.pop("_PARAMETER_PRIORITIES", None)
 
         rows.append(row)
 

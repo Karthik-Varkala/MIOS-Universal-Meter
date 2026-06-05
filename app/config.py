@@ -21,6 +21,7 @@ DB_EVENT_PARAMETER_TABLE = os.getenv("DB_EVENT_PARAMETER_TABLE", "EVENT_PARAMETE
 DB_PARAMETER_MAPPING_TABLE = os.getenv("DB_PARAMETER_MAPPING_TABLE", "PARAMETER_MAPPING")
 
 LOAD_PROFILE_INDEX = "meter-load-profile-data"
+INSTANTANEOUS_INDEX = "meter-instantaneous-data"
 EVENT_INDEX = "meter-event-data"
 DAY_PROFILE_INDEX = "meter-day-profile-data"
 BILLING_INDEX = "meter-billing-data"

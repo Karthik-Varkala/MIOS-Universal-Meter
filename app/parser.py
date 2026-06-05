@@ -11,9 +11,13 @@ from .validation import ensure_records_present, require_xml_attribute, require_x
 def get_cdf_files(directory_path: str):
     if not os.path.isdir(directory_path):
         raise HTTPException(status_code=400, detail=f"Directory not found: {directory_path}")
-    files = [f for f in os.listdir(directory_path) if f.lower().endswith(".cdf")]
+    files = [
+        f
+        for f in os.listdir(directory_path)
+        if os.path.isfile(os.path.join(directory_path, f))
+    ]
     if not files:
-        raise HTTPException(status_code=404, detail="No .cdf files found.")
+        raise HTTPException(status_code=404, detail="No files found.")
     return files
 
 
@@ -240,12 +244,12 @@ def extract_billing(root, meter_no, file_path: str = ""):
         }
 
         for billing_index, b_tag in enumerate(sub, start=1):
-            if b_tag.tag not in ["B2", "B5"]:
+            if b_tag.tag != "B5":
                 continue
 
             if not (b_tag.get("PARAMCODE") or b_tag.get("CODE")):
                 _raise_data_validation_error(
-                    "Missing billing parameter code in B2/B5 tag.",
+                    "Missing billing parameter code in B5 tag.",
                     operation="extract_billing",
                     file_path=file_path,
                     section=sub.tag,

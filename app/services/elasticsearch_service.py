@@ -12,18 +12,34 @@ from ..config import (
     ES_ENDPOINT,
     DAY_PROFILE_INDEX,
     EVENT_INDEX,
+    INSTANTANEOUS_INDEX,
     LOAD_PROFILE_CORE_HEADERS,
     LOAD_PROFILE_INDEX,
 )
 from ..logging_utils import get_logger, log_exception
+from ..validation import (
+    is_expected_file_processing_issue,
+    log_processing_failure,
+    parse_cdf_xml,
+    require_meter_no,
+)
 from .sql_service import get_parameter_mappings_for_table
-from ..validation import log_processing_failure, parse_cdf_xml, require_meter_no
 
 es_client = Elasticsearch(
     ES_ENDPOINT,
     api_key=ES_API_KEY,
 )
 logger = get_logger(__name__)
+
+
+def _build_skipped_file_result(file_path: str, operation_name: str, exc: Exception) -> dict:
+    detail = str(getattr(exc, "detail", exc))
+    return {
+        "file_path": file_path,
+        "operation": operation_name,
+        "error_type": type(exc).__name__,
+        "reason": detail,
+    }
 
 
 def publish_to_es_helper(data: list, index_name: str):
@@ -335,6 +351,125 @@ def fetch_all_billing_docs_from_es(meter_no: str):
                 pass
 
 
+SQL_EXPORT_DATASETS = {
+    "load_profile": {
+        "index_name": LOAD_PROFILE_INDEX,
+        "source_fields": ["meter_no", "date", "interval", "timestamp", "parameters"],
+    },
+    "billing": {
+        "index_name": BILLING_INDEX,
+        "source_fields": [
+            "meter_no",
+            "section",
+            "date_time",
+            "timestamp",
+            "reset_method",
+            "power_on_duration",
+            "power_off_duration",
+            "cumulative_tamper_count",
+            "parameters",
+        ],
+    },
+    "event": {
+        "index_name": EVENT_INDEX,
+        "source_fields": ["meter_no", "event_index", "code", "status", "logid", "time", "timestamp", "parameters"],
+    },
+    "day_profile": {
+        "index_name": DAY_PROFILE_INDEX,
+        "source_fields": ["meter_no", "datetime", "timestamp", "parameters"],
+    },
+}
+
+
+def _build_sql_export_query(meter_nos: list[str] = None, start_date: str = None, end_date: str = None):
+    filters = []
+
+    if meter_nos:
+        if len(meter_nos) == 1:
+            filters.append({"term": {"meter_no.keyword": meter_nos[0]}})
+        else:
+            filters.append({"terms": {"meter_no.keyword": meter_nos}})
+
+    if start_date and end_date:
+        start_datetime = parse_request_date(start_date).replace(hour=0, minute=0, second=0)
+        end_datetime = parse_request_date(end_date).replace(hour=23, minute=59, second=59)
+        filters.append(
+            {
+                "range": {
+                    "timestamp": {
+                        "gte": start_datetime.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "lte": end_datetime.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                }
+            }
+        )
+
+    if not filters:
+        return {"match_all": {}}
+
+    return {"bool": {"filter": filters}}
+
+
+def fetch_sql_export_docs_from_es(
+    index_name: str,
+    source_fields: list[str],
+    meter_nos: list[str] = None,
+    start_date: str = None,
+    end_date: str = None,
+):
+    query = _build_sql_export_query(meter_nos=meter_nos, start_date=start_date, end_date=end_date)
+    scroll_id = None
+    all_hits = []
+
+    try:
+        response = es_client.search(
+            index=index_name,
+            body={"size": 1000, "_source": source_fields, "query": query},
+            scroll="2m",
+        )
+        scroll_id = response.get("_scroll_id")
+        hits = response.get("hits", {}).get("hits", [])
+        all_hits.extend(hits)
+
+        while hits:
+            response = es_client.scroll(scroll_id=scroll_id, scroll="2m")
+            scroll_id = response.get("_scroll_id", scroll_id)
+            hits = response.get("hits", {}).get("hits", [])
+            all_hits.extend(hits)
+
+        return all_hits
+    except Exception as exc:
+        log_exception(
+            logger,
+            "Elasticsearch SQL export search failed",
+            exc,
+            index_name=index_name,
+            meter_nos=meter_nos or [],
+            start_date=start_date,
+            end_date=end_date,
+        )
+        raise HTTPException(status_code=500, detail=f"Elasticsearch Search Error: {str(exc)}")
+    finally:
+        if scroll_id:
+            try:
+                es_client.clear_scroll(scroll_id=scroll_id)
+            except Exception:
+                pass
+
+
+def fetch_all_sql_export_docs_from_es(meter_nos: list[str] = None, start_date: str = None, end_date: str = None):
+    return {
+        dataset_name: fetch_sql_export_docs_from_es(
+            index_name=config["index_name"],
+            source_fields=config["source_fields"],
+            meter_nos=meter_nos,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        for dataset_name, config in SQL_EXPORT_DATASETS.items()
+    }
+
+
 def build_load_profile_export_rows(hits: list):
     parameter_codes = set()
     for hit in hits:
@@ -493,9 +628,113 @@ def build_day_profile_es_documents(day_profile_data: list):
     return transformed_data
 
 
+ALL_DATASET_PIPELINES = (
+    {
+        "name": "instantaneous",
+        "extractor": parser.extract_instantaneous,
+        "index_name": INSTANTANEOUS_INDEX,
+        "transformer": None,
+    },
+    {
+        "name": "load_profile",
+        "extractor": parser.extract_load_profile,
+        "index_name": LOAD_PROFILE_INDEX,
+        "transformer": build_load_profile_es_documents,
+    },
+    {
+        "name": "billing",
+        "extractor": parser.extract_billing,
+        "index_name": BILLING_INDEX,
+        "transformer": build_billing_es_documents,
+    },
+    {
+        "name": "event",
+        "extractor": parser.extract_events,
+        "index_name": EVENT_INDEX,
+        "transformer": build_event_es_documents,
+    },
+    {
+        "name": "day_profile",
+        "extractor": parser.extract_day_profile,
+        "index_name": DAY_PROFILE_INDEX,
+        "transformer": build_day_profile_es_documents,
+    },
+)
+
+
+def _make_dataset_stats():
+    return {
+        pipeline["name"]: {
+            "published_records": 0,
+            "successful_files": 0,
+            "empty_files": 0,
+            "failed_files": 0,
+        }
+        for pipeline in ALL_DATASET_PIPELINES
+    }
+
+
+def _process_all_datasets_for_root(root, file_path: str, meter_no: str, dataset_stats: dict):
+    file_results = {}
+
+    for pipeline in ALL_DATASET_PIPELINES:
+        dataset_name = pipeline["name"]
+        try:
+            raw_rows = pipeline["extractor"](root, meter_no, file_path=file_path)
+            if not raw_rows:
+                dataset_stats[dataset_name]["empty_files"] += 1
+                file_results[dataset_name] = {
+                    "status": "empty",
+                    "published_records": 0,
+                }
+                continue
+
+            transformed_rows = (
+                pipeline["transformer"](raw_rows) if pipeline["transformer"] else raw_rows
+            )
+            publish_result = publish_to_es_helper(transformed_rows, index_name=pipeline["index_name"])
+            published_records = len(transformed_rows)
+            dataset_stats[dataset_name]["published_records"] += published_records
+            dataset_stats[dataset_name]["successful_files"] += 1
+            file_results[dataset_name] = {
+                "status": "success",
+                "published_records": published_records,
+                "elasticsearch": publish_result,
+            }
+        except HTTPException as exc:
+            detail = str(getattr(exc, "detail", exc))
+            if "Missing required XML section" in detail or ("No " in detail and "records found" in detail):
+                dataset_stats[dataset_name]["empty_files"] += 1
+                file_results[dataset_name] = {
+                    "status": "skipped",
+                    "published_records": 0,
+                    "reason": detail,
+                }
+                continue
+
+            dataset_stats[dataset_name]["failed_files"] += 1
+            failure = log_processing_failure(file_path, f"publish_all_data_to_es:{dataset_name}", exc)
+            file_results[dataset_name] = {
+                "status": "failed",
+                "published_records": 0,
+                "error": failure,
+            }
+        except Exception as exc:
+            dataset_stats[dataset_name]["failed_files"] += 1
+            failure = log_processing_failure(file_path, f"publish_all_data_to_es:{dataset_name}", exc)
+            file_results[dataset_name] = {
+                "status": "failed",
+                "published_records": 0,
+                "error": failure,
+            }
+
+    return file_results
+
+
 def publish_directory_data_to_es(directory_path: str, extractor, index_name: str, transformer=None):
     all_data = []
     processed_files = 0
+    skipped_files = []
     failed_files = []
     files = parser.get_cdf_files(directory_path)
 
@@ -511,6 +750,10 @@ def publish_directory_data_to_es(directory_path: str, extractor, index_name: str
             all_data.extend(data)
             processed_files += 1
         except Exception as exc:
+            if is_expected_file_processing_issue(exc):
+                skipped_files.append(_build_skipped_file_result(file_path, "publish_directory_data_to_es", exc))
+                continue
+
             failed_files.append(log_processing_failure(file_path, "publish_directory_data_to_es", exc))
             continue
 
@@ -523,8 +766,57 @@ def publish_directory_data_to_es(directory_path: str, extractor, index_name: str
         "status": "success",
         "directory_path": directory_path,
         "processed_files": processed_files,
-        "skipped_files": len(failed_files),
+        "skipped_files": len(skipped_files),
+        "skipped_file_details": skipped_files,
+        "failed_files_count": len(failed_files),
         "failed_files": failed_files,
         "total_records": len(all_data),
         "elasticsearch": es_result,
+    }
+
+
+def publish_all_data_to_es(file_path: str = None, directory_path: str = None):
+    if not file_path and not directory_path:
+        raise HTTPException(status_code=400, detail="Provide either file_path or directory_path.")
+
+    source_files = [file_path] if file_path else [os.path.join(directory_path, file_name) for file_name in parser.get_cdf_files(directory_path)]
+    dataset_stats = _make_dataset_stats()
+    file_results = []
+    processed_files = 0
+    skipped_files = []
+    failed_files = []
+
+    for source_file in source_files:
+        try:
+            tree = parse_cdf_xml(source_file)
+            root = tree.getroot()
+            meter_no = require_meter_no(root, file_path=source_file, operation="publish_all_data_to_es")
+            results = _process_all_datasets_for_root(root, source_file, meter_no, dataset_stats)
+            processed_files += 1
+            file_results.append(
+                {
+                    "file_path": source_file,
+                    "meter_no": meter_no,
+                    "datasets": results,
+                }
+            )
+        except Exception as exc:
+            if is_expected_file_processing_issue(exc):
+                skipped_files.append(_build_skipped_file_result(source_file, "publish_all_data_to_es", exc))
+                continue
+
+            failed_files.append(log_processing_failure(source_file, "publish_all_data_to_es", exc))
+
+    return {
+        "status": "success",
+        "source_type": "file" if file_path else "directory",
+        "file_path": file_path,
+        "directory_path": directory_path,
+        "processed_files": processed_files,
+        "skipped_files": len(skipped_files),
+        "skipped_file_details": skipped_files,
+        "failed_files_count": len(failed_files),
+        "failed_files": failed_files,
+        "datasets": dataset_stats,
+        "file_results": file_results[:100],
     }

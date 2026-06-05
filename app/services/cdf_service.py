@@ -5,7 +5,12 @@ from fastapi import HTTPException
 
 from .. import parser
 from ..config import BILLING_HEADERS, INSTANTANEOUS_HEADERS, LOAD_PROFILE_CORE_HEADERS
-from ..validation import log_processing_failure, parse_cdf_xml, require_meter_no
+from ..validation import (
+    is_expected_file_processing_issue,
+    log_processing_failure,
+    parse_cdf_xml,
+    require_meter_no,
+)
 
 
 def _build_load_profile_headers(data: list):
@@ -13,6 +18,16 @@ def _build_load_profile_headers(data: list):
         list(set(key for row in data for key in row.keys() if key not in LOAD_PROFILE_CORE_HEADERS))
     )
     return LOAD_PROFILE_CORE_HEADERS + other_headers
+
+
+def _build_skipped_file_result(file_path: str, operation_name: str, exc: Exception) -> dict:
+    detail = str(getattr(exc, "detail", exc))
+    return {
+        "file_path": file_path,
+        "operation": operation_name,
+        "error_type": type(exc).__name__,
+        "reason": detail,
+    }
 
 
 def _process_directory(
@@ -24,6 +39,7 @@ def _process_directory(
     is_dict_writer=False,
 ):
     all_data = []
+    skipped_files = []
     failed_files = []
     files = parser.get_cdf_files(directory_path)
     processed_files = 0
@@ -45,13 +61,19 @@ def _process_directory(
                     parser.save_csv(data, csv_path, headers, is_dict_writer=is_dict_writer)
             processed_files += 1
         except Exception as exc:
+            if is_expected_file_processing_issue(exc):
+                skipped_files.append(_build_skipped_file_result(file_path, operation_name, exc))
+                continue
+
             failed_files.append(log_processing_failure(file_path, operation_name, exc))
             continue
 
     return {
         "status": "success",
         "processed_files": processed_files,
-        "skipped_files": len(failed_files),
+        "skipped_files": len(skipped_files),
+        "skipped_file_details": skipped_files,
+        "failed_files_count": len(failed_files),
         "failed_files": failed_files,
         "total_records": len(all_data),
         "preview": all_data[:100],
@@ -77,10 +99,33 @@ def _process_file(file_path: str, extractor, csv_suffix: str, operation_name: st
         return {"status": "success", "meter_no": meter_no, "total_records": len(data), "data": data[:100]}
     except HTTPException as exc:
         log_processing_failure(file_path, operation_name, exc)
-        raise
+        if is_expected_file_processing_issue(exc):
+            return {
+                "status": "skipped",
+                "file_path": file_path,
+                "operation": operation_name,
+                "reason": str(getattr(exc, "detail", exc)),
+                "total_records": 0,
+                "data": [],
+            }
+        return {
+            "status": "failed",
+            "file_path": file_path,
+            "operation": operation_name,
+            "reason": str(getattr(exc, "detail", exc)),
+            "total_records": 0,
+            "data": [],
+        }
     except Exception as exc:
         log_processing_failure(file_path, operation_name, exc)
-        raise
+        return {
+            "status": "failed",
+            "file_path": file_path,
+            "operation": operation_name,
+            "reason": str(exc),
+            "total_records": 0,
+            "data": [],
+        }
 
 
 def process_directory_instantaneous(directory_path: str):

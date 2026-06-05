@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -46,7 +47,10 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
     log_with_context(logger, 40, "Request validation failed", **context)
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "message": "Request validation failed."},
+        content={
+            "detail": jsonable_encoder(exc.errors()),
+            "message": "Request validation failed.",
+        },
     )
 
 

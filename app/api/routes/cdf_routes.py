@@ -1,6 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from ...models import DirectoryRequest, FileRequest, S3Request
 from ...services.cdf_service import (
     process_directory_billing,
     process_directory_instantaneous,
@@ -10,69 +9,79 @@ from ...services.cdf_service import (
     process_file_load_profile,
 )
 from ...services.s3_service import download_s3_file
+from ..request_parsing import extract_single_path, extract_s3_request
 
 
 router = APIRouter()
 
 
 @router.post("/api/dir/instantaneous")
-def get_dir_instantaneous(req: DirectoryRequest):
-    return process_directory_instantaneous(req.directory_path)
+async def get_dir_instantaneous(request: Request):
+    directory_path = await extract_single_path(request, "directory_path")
+    return process_directory_instantaneous(directory_path)
 
 
 @router.post("/api/dir/load-profile")
-def get_dir_load_profile(req: DirectoryRequest):
-    return process_directory_load_profile(req.directory_path)
+async def get_dir_load_profile(request: Request):
+    directory_path = await extract_single_path(request, "directory_path")
+    return process_directory_load_profile(directory_path)
 
 
 @router.post("/api/dir/billing")
-def get_dir_billing(req: DirectoryRequest):
-    return process_directory_billing(req.directory_path)
+async def get_dir_billing(request: Request):
+    directory_path = await extract_single_path(request, "directory_path")
+    return process_directory_billing(directory_path)
 
 
 @router.post("/api/file/instantaneous")
-def get_single_file_instantaneous(req: FileRequest):
-    return process_file_instantaneous(req.file_path)
+async def get_single_file_instantaneous(request: Request):
+    file_path = await extract_single_path(request, "file_path")
+    return process_file_instantaneous(file_path)
 
 
 @router.post("/api/file/load-profile")
-def get_single_file_load_profile(req: FileRequest):
-    return process_file_load_profile(req.file_path)
+async def get_single_file_load_profile(request: Request):
+    file_path = await extract_single_path(request, "file_path")
+    return process_file_load_profile(file_path)
 
 
 @router.post("/api/file/billing")
-def get_single_file_billing(req: FileRequest):
-    return process_file_billing(req.file_path)
+async def get_single_file_billing(request: Request):
+    file_path = await extract_single_path(request, "file_path")
+    return process_file_billing(file_path)
 
 
 @router.post("/api/s3/instantaneous")
-def process_s3_instantaneous(req: S3Request):
-    local_file_path = download_s3_file(req.bucket_name, req.object_key, req.download_dir)
+async def process_s3_instantaneous(request: Request):
+    req_data = await extract_s3_request(request)
+    local_file_path = download_s3_file(req_data["bucket_name"], req_data["object_key"], req_data["download_dir"])
     try:
         return process_file_instantaneous(local_file_path)
     except HTTPException as exc:
-        if exc.status_code == 400 and str(exc.detail).startswith("XML Parse Error:"):
-            raise HTTPException(status_code=400, detail="Invalid XML format in downloaded file.")
+        if exc.status_code == 400 and str(exc.detail).startswith("Unable to read file:"):
+            raise HTTPException(status_code=400, detail="Unable to read the downloaded file.")
         raise
 
 
 @router.post("/api/s3/load-profile")
-def process_s3_load_profile(req: S3Request):
-    local_file_path = download_s3_file(req.bucket_name, req.object_key, req.download_dir)
+async def process_s3_load_profile(request: Request):
+    req_data = await extract_s3_request(request)
+    local_file_path = download_s3_file(req_data["bucket_name"], req_data["object_key"], req_data["download_dir"])
     try:
         return process_file_load_profile(local_file_path)
     except HTTPException as exc:
-        if exc.status_code == 400 and str(exc.detail).startswith("XML Parse Error:"):
-            raise HTTPException(status_code=400, detail="Invalid XML format in downloaded file.")
+        if exc.status_code == 400 and str(exc.detail).startswith("Unable to read file:"):
+            raise HTTPException(status_code=400, detail="Unable to read the downloaded file.")
         raise
 
 
 @router.post("/api/s3/billing")
-def process_s3_billing(req: S3Request):
-    local_file_path = download_s3_file(req.bucket_name, req.object_key, req.download_dir)
+async def process_s3_billing(request: Request):
+    req_data = await extract_s3_request(request)
+    local_file_path = download_s3_file(req_data["bucket_name"], req_data["object_key"], req_data["download_dir"])
     try:
         return process_file_billing(local_file_path)
     except HTTPException as exc:
-        if exc.status_code == 400 and str(exc.detail).startswith("XML Parse Error:"):
-            raise HTTPException(status_code=400, detail="Invalid XML format in downloaded file.")
+        if exc.status_code == 400 and str(exc.detail).startswith("Unable to read file:"):
+            raise HTTPException(status_code=400, detail="Unable to read the downloaded file.")
         raise
