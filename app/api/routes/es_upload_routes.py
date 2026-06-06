@@ -1,8 +1,13 @@
 import csv
+import os
+import re
+import shutil
+import tempfile
 from io import StringIO
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from ... import parser
 from ...config import (
@@ -28,6 +33,35 @@ from ..request_parsing import extract_all_data_paths, extract_single_path
 
 
 router = APIRouter()
+
+
+def _safe_upload_name(filename: str | None) -> str:
+    raw_name = str(filename or "uploaded.cdf").replace("\\", "/").split("/")[-1]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip()
+    return name or "uploaded.cdf"
+
+
+def _unique_upload_path(upload_dir: str, filename: str | None) -> str:
+    safe_name = _safe_upload_name(filename)
+    candidate = Path(upload_dir) / safe_name
+    if not candidate.exists():
+        return str(candidate)
+
+    stem = candidate.stem or "uploaded"
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        candidate = Path(upload_dir) / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return str(candidate)
+        counter += 1
+
+
+def _publish_uploaded_directory(temp_dir: str, uploaded_names: list[str]) -> dict:
+    result = publish_all_data_to_es(directory_path=temp_dir)
+    result["uploaded_files"] = uploaded_names
+    result["uploaded_files_count"] = len(uploaded_names)
+    return result
 
 
 def _publish_single_file(file_path: str, extractor, index_name: str, transformer=None):
@@ -232,3 +266,131 @@ async def es_push_all_data(
         file_path=payload.get("file_path"),
         directory_path=payload.get("directory_path"),
     )
+
+
+@router.post("/api/elasticsearch/all-data/upload")
+async def es_push_all_data_upload(file: UploadFile = File(...)):
+    suffix = Path(_safe_upload_name(file.filename)).suffix or ".cdf"
+    temp_file_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+
+        result = publish_all_data_to_es(file_path=temp_file_path)
+        result["uploaded_filename"] = _safe_upload_name(file.filename)
+        return result
+    finally:
+        await file.close()
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@router.post("/api/elasticsearch/all-data/upload-folder")
+async def es_push_all_data_upload_folder(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one file.")
+
+    temp_dir = tempfile.mkdtemp(prefix="cdf_upload_")
+    uploaded_names = []
+
+    try:
+        for upload in files:
+            destination = _unique_upload_path(temp_dir, upload.filename)
+            with open(destination, "wb") as output_file:
+                shutil.copyfileobj(upload.file, output_file)
+            uploaded_names.append(_safe_upload_name(upload.filename))
+
+        return _publish_uploaded_directory(temp_dir, uploaded_names)
+    finally:
+        for upload in files:
+            await upload.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@router.get("/upload", response_class=HTMLResponse, include_in_schema=False)
+async def upload_page():
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CDF Upload</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f6f8fb; color: #172033; }
+    main { max-width: 920px; margin: 40px auto; padding: 0 20px; }
+    section { background: #fff; border: 1px solid #d9e0ea; border-radius: 8px; padding: 24px; margin-bottom: 18px; }
+    h1 { font-size: 28px; margin: 0 0 18px; }
+    h2 { font-size: 18px; margin: 0 0 14px; }
+    input { display: block; margin: 12px 0; }
+    button { background: #1464f4; border: 0; border-radius: 6px; color: #fff; cursor: pointer; font-size: 15px; padding: 10px 14px; }
+    button:disabled { background: #94a3b8; cursor: wait; }
+    pre { background: #111827; border-radius: 8px; color: #d1fae5; min-height: 180px; overflow: auto; padding: 16px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CDF Upload</h1>
+
+    <section>
+      <h2>Single file</h2>
+      <input id="singleFile" type="file" />
+      <button id="singleButton" onclick="uploadSingle()">Upload file</button>
+    </section>
+
+    <section>
+      <h2>Folder</h2>
+      <input id="folderFiles" type="file" webkitdirectory directory multiple />
+      <button id="folderButton" onclick="uploadFolder()">Upload folder</button>
+    </section>
+
+    <pre id="result">Ready.</pre>
+  </main>
+
+  <script>
+    const result = document.getElementById("result");
+
+    async function postForm(url, formData, buttonId) {
+      const button = document.getElementById(buttonId);
+      button.disabled = true;
+      result.textContent = "Uploading and processing...";
+      try {
+        const response = await fetch(url, { method: "POST", body: formData });
+        const data = await response.json();
+        result.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        result.textContent = String(error);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function uploadSingle() {
+      const input = document.getElementById("singleFile");
+      if (!input.files.length) {
+        result.textContent = "Choose one file first.";
+        return;
+      }
+      const formData = new FormData();
+      formData.append("file", input.files[0], input.files[0].name);
+      postForm("/api/elasticsearch/all-data/upload", formData, "singleButton");
+    }
+
+    function uploadFolder() {
+      const input = document.getElementById("folderFiles");
+      if (!input.files.length) {
+        result.textContent = "Choose one folder first.";
+        return;
+      }
+      const formData = new FormData();
+      for (const file of input.files) {
+        formData.append("files", file, file.webkitRelativePath || file.name);
+      }
+      postForm("/api/elasticsearch/all-data/upload-folder", formData, "folderButton");
+    }
+  </script>
+</body>
+</html>
+"""
