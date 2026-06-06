@@ -10,6 +10,7 @@ from ..config import (
     DB_LOAD_PROFILE_TABLE,
     ES_API_KEY,
     ES_ENDPOINT,
+    ES_CLOUD_ID,
     DAY_PROFILE_INDEX,
     EVENT_INDEX,
     INSTANTANEOUS_INDEX,
@@ -26,8 +27,9 @@ from ..validation import (
 from .sql_service import get_parameter_mappings_for_table
 
 es_client = Elasticsearch(
-    ES_ENDPOINT,
+   cloud_id=ES_CLOUD_ID,
     api_key=ES_API_KEY,
+
 )
 logger = get_logger(__name__)
 

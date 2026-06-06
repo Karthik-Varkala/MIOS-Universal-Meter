@@ -7,6 +7,7 @@ load_dotenv()
 
 ES_ENDPOINT = os.getenv("ES_ENDPOINT")
 ES_API_KEY = os.getenv("ES_API_KEY")
+ES_CLOUD_ID = os.getenv("ES_CLOUD_ID")
 
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
