@@ -15,6 +15,7 @@ from ..config import (
     DB_PARAMETER_MAPPING_TABLE,
     DB_PASSWORD,
     DB_PORT,
+    DB_UPLOAD_HISTORY_TABLE,
     DB_USER,
     EVENT_SQL_UNIQUE_KEY_COLUMNS,
 )
@@ -73,6 +74,13 @@ PROFILE_COLUMN_ALIASES = {
     },
 }
 
+SQL_METER_DATA_TABLES = (
+    DB_LOAD_PROFILE_TABLE,
+    DB_DAY_PROFILE_TABLE,
+    DB_BILLING_TABLE,
+    DB_EVENT_TABLE,
+)
+
 
 def quote_mysql_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
@@ -117,6 +125,195 @@ def get_mysql_connection():
     except Exception as exc:
         log_exception(logger, "MySQL connection failed", exc, database=DB_NAME, host=DB_HOST, port=DB_PORT)
         raise HTTPException(status_code=500, detail=f"MySQL Connection Error: {str(exc)}")
+
+
+def mysql_table_exists(connection, table_name: str) -> bool:
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) "
+            "FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (table_name,),
+        )
+        row = cursor.fetchone()
+        return bool(row and row[0])
+    finally:
+        cursor.close()
+
+
+def mysql_column_exists(connection, table_name: str, column_name: str) -> bool:
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (table_name, column_name),
+        )
+        row = cursor.fetchone()
+        return bool(row and row[0])
+    finally:
+        cursor.close()
+
+
+def get_existing_meter_data_tables(connection) -> list[str]:
+    return [
+        table_name
+        for table_name in SQL_METER_DATA_TABLES
+        if mysql_table_exists(connection, table_name) and mysql_column_exists(connection, table_name, "METER_NO")
+    ]
+
+
+def get_distinct_meter_numbers_from_sql() -> dict:
+    connection = get_mysql_connection()
+    cursor = connection.cursor()
+    try:
+        table_names = get_existing_meter_data_tables(connection)
+        meter_numbers = set()
+        counts_by_table = {}
+
+        for table_name in table_names:
+            cursor.execute(
+                f"SELECT DISTINCT {quote_mysql_identifier('METER_NO')} "
+                f"FROM {quote_mysql_identifier(table_name)} "
+                f"WHERE {quote_mysql_identifier('METER_NO')} IS NOT NULL "
+                f"AND {quote_mysql_identifier('METER_NO')} <> ''"
+            )
+            table_meter_numbers = {str(row[0]) for row in cursor.fetchall() if row and row[0] not in (None, "")}
+            meter_numbers.update(table_meter_numbers)
+            counts_by_table[table_name] = len(table_meter_numbers)
+
+        return {
+            "meter_numbers": sorted(meter_numbers),
+            "count": len(meter_numbers),
+            "tables": table_names,
+            "counts_by_table": counts_by_table,
+        }
+    except Exception as exc:
+        log_exception(logger, "MySQL distinct meter lookup failed", exc, tables=SQL_METER_DATA_TABLES)
+        raise HTTPException(status_code=500, detail=f"MySQL Meter Lookup Error: {str(exc)}")
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def delete_meter_data_from_sql(meter_no: str) -> dict:
+    connection = get_mysql_connection()
+    cursor = connection.cursor()
+    try:
+        table_names = get_existing_meter_data_tables(connection)
+        deleted_rows_by_table = {}
+        total_deleted_rows = 0
+
+        for table_name in table_names:
+            cursor.execute(
+                f"DELETE FROM {quote_mysql_identifier(table_name)} "
+                f"WHERE {quote_mysql_identifier('METER_NO')} = %s",
+                (meter_no,),
+            )
+            deleted_rows_by_table[table_name] = cursor.rowcount
+            total_deleted_rows += cursor.rowcount
+
+        connection.commit()
+        return {
+            "meter_no": meter_no,
+            "deleted_rows": total_deleted_rows,
+            "deleted_rows_by_table": deleted_rows_by_table,
+            "tables": table_names,
+        }
+    except Exception as exc:
+        connection.rollback()
+        log_exception(logger, "MySQL meter delete failed", exc, meter_no=meter_no, tables=SQL_METER_DATA_TABLES)
+        raise HTTPException(status_code=500, detail=f"MySQL Meter Delete Error: {str(exc)}")
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def ensure_upload_history_table(connection):
+    create_upload_history_sql = (
+        f"CREATE TABLE IF NOT EXISTS {quote_mysql_identifier(DB_UPLOAD_HISTORY_TABLE)} ("
+        f"{quote_mysql_identifier('ID')} BIGINT NOT NULL AUTO_INCREMENT, "
+        f"{quote_mysql_identifier('FILE_NAME')} VARCHAR(512) NOT NULL, "
+        f"{quote_mysql_identifier('FILE_SIZE_BYTES')} BIGINT NOT NULL, "
+        f"{quote_mysql_identifier('UPLOAD_SOURCE')} VARCHAR(32) NOT NULL, "
+        f"{quote_mysql_identifier('UPLOADED_AT')} DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        f"PRIMARY KEY ({quote_mysql_identifier('ID')}), "
+        f"KEY {quote_mysql_identifier('IX_UPLOAD_HISTORY_UPLOADED_AT')} ({quote_mysql_identifier('UPLOADED_AT')})"
+        f")"
+    )
+    cursor = connection.cursor()
+    try:
+        cursor.execute(create_upload_history_sql)
+        connection.commit()
+    finally:
+        cursor.close()
+
+
+def save_upload_history_rows(rows: list[dict]) -> int:
+    if not rows:
+        return 0
+
+    connection = get_mysql_connection()
+    insert_sql = (
+        f"INSERT INTO {quote_mysql_identifier(DB_UPLOAD_HISTORY_TABLE)} "
+        f"({quote_mysql_identifier('FILE_NAME')}, {quote_mysql_identifier('FILE_SIZE_BYTES')}, "
+        f"{quote_mysql_identifier('UPLOAD_SOURCE')}) "
+        f"VALUES (%s, %s, %s)"
+    )
+    values = [
+        (
+            str(row.get("file_name") or ""),
+            int(row.get("file_size_bytes") or 0),
+            str(row.get("upload_source") or ""),
+        )
+        for row in rows
+    ]
+
+    try:
+        ensure_upload_history_table(connection)
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(insert_sql, values)
+            connection.commit()
+            return cursor.rowcount
+        finally:
+            cursor.close()
+    except Exception as exc:
+        connection.rollback()
+        log_exception(logger, "MySQL upload history insert failed", exc, table=DB_UPLOAD_HISTORY_TABLE, row_count=len(rows))
+        raise HTTPException(status_code=500, detail=f"MySQL Upload History Insert Error: {str(exc)}")
+    finally:
+        connection.close()
+
+
+def get_upload_history_from_sql(limit: int = 100) -> dict:
+    connection = get_mysql_connection()
+    cursor = connection.cursor(dictionary=True)
+    try:
+        ensure_upload_history_table(connection)
+        cursor.execute(
+            f"SELECT {quote_mysql_identifier('ID')}, {quote_mysql_identifier('FILE_NAME')}, "
+            f"{quote_mysql_identifier('FILE_SIZE_BYTES')}, {quote_mysql_identifier('UPLOAD_SOURCE')}, "
+            f"{quote_mysql_identifier('UPLOADED_AT')} "
+            f"FROM {quote_mysql_identifier(DB_UPLOAD_HISTORY_TABLE)} "
+            f"ORDER BY {quote_mysql_identifier('UPLOADED_AT')} DESC, {quote_mysql_identifier('ID')} DESC "
+            f"LIMIT %s",
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        return {
+            "table": DB_UPLOAD_HISTORY_TABLE,
+            "count": len(rows),
+            "uploads": rows,
+        }
+    except Exception as exc:
+        log_exception(logger, "MySQL upload history lookup failed", exc, table=DB_UPLOAD_HISTORY_TABLE)
+        raise HTTPException(status_code=500, detail=f"MySQL Upload History Lookup Error: {str(exc)}")
+    finally:
+        cursor.close()
+        connection.close()
 
 
 def ensure_parameter_mapping_table(connection):

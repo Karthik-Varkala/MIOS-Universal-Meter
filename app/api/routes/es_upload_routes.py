@@ -28,6 +28,7 @@ from ...services.elasticsearch_service import (
     publish_directory_data_to_es,
     publish_to_es_helper,
 )
+from ...services.sql_service import save_upload_history_rows
 from ...validation import is_expected_file_processing_issue, normalize_path_text, parse_cdf_xml, require_meter_no
 from ..request_parsing import extract_all_data_paths, extract_single_path
 
@@ -39,6 +40,20 @@ def _safe_upload_name(filename: str | None) -> str:
     raw_name = str(filename or "uploaded.cdf").replace("\\", "/").split("/")[-1]
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip()
     return name or "uploaded.cdf"
+
+
+def _upload_display_name(filename: str | None) -> str:
+    raw_name = str(filename or "uploaded.cdf").replace("\\", "/").strip()
+    raw_name = re.sub(r"[\x00-\x1f]", "_", raw_name)
+    return raw_name.strip("/") or "uploaded.cdf"
+
+
+def _build_upload_history_row(filename: str | None, file_size_bytes: int, upload_source: str) -> dict:
+    return {
+        "file_name": _upload_display_name(filename),
+        "file_size_bytes": file_size_bytes,
+        "upload_source": upload_source,
+    }
 
 
 def _unique_upload_path(upload_dir: str, filename: str | None) -> str:
@@ -280,6 +295,9 @@ async def es_push_all_data_upload(file: UploadFile = File(...)):
 
         result = publish_all_data_to_es(file_path=temp_file_path)
         result["uploaded_filename"] = _safe_upload_name(file.filename)
+        result["upload_history_rows"] = save_upload_history_rows(
+            [_build_upload_history_row(file.filename, os.path.getsize(temp_file_path), "file")]
+        )
         return result
     finally:
         await file.close()
@@ -296,13 +314,19 @@ async def es_push_all_data_upload_folder(files: list[UploadFile] = File(...)):
     uploaded_names = []
 
     try:
+        upload_history_rows = []
         for upload in files:
             destination = _unique_upload_path(temp_dir, upload.filename)
             with open(destination, "wb") as output_file:
                 shutil.copyfileobj(upload.file, output_file)
             uploaded_names.append(_safe_upload_name(upload.filename))
+            upload_history_rows.append(
+                _build_upload_history_row(upload.filename, os.path.getsize(destination), "folder")
+            )
 
-        return _publish_uploaded_directory(temp_dir, uploaded_names)
+        result = _publish_uploaded_directory(temp_dir, uploaded_names)
+        result["upload_history_rows"] = save_upload_history_rows(upload_history_rows)
+        return result
     finally:
         for upload in files:
             await upload.close()

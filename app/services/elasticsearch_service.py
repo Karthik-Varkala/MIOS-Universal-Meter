@@ -27,6 +27,7 @@ from ..validation import (
 from .sql_service import get_parameter_mappings_for_table
 
 es_client = Elasticsearch(
+    # ES_ENDPOINT,
    cloud_id=ES_CLOUD_ID,
     api_key=ES_API_KEY,
 

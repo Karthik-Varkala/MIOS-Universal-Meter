@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from ...config import (
     DB_BILLING_TABLE,
@@ -9,6 +9,7 @@ from ...config import (
     DB_EVENT_TABLE,
     DB_LOAD_PROFILE_TABLE,
     DB_NAME,
+    DB_UPLOAD_HISTORY_TABLE,
 )
 from ...models import EsToSqlAllDataRequest, LoadProfileExportRequest, MeterDateRequest, MeterRequest
 from ...services.elasticsearch_service import (
@@ -28,11 +29,15 @@ from ...services.sql_service import (
     build_day_profile_sql_rows,
     build_event_sql_rows,
     build_load_profile_sql_rows,
+    delete_meter_data_from_sql,
+    get_distinct_meter_numbers_from_sql,
+    get_upload_history_from_sql,
     save_billing_rows_to_sql,
     save_day_profile_rows_to_sql,
     save_event_rows_to_sql,
     save_load_profile_rows_to_sql,
 )
+from ...validation import validate_non_empty_text
 
 
 router = APIRouter()
@@ -61,6 +66,38 @@ SQL_EXPORT_DATASET_HANDLERS = {
         "saver": save_day_profile_rows_to_sql,
     },
 }
+
+
+@router.get("/api/sql/meters")
+def get_sql_meter_numbers():
+    result = get_distinct_meter_numbers_from_sql()
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        **result,
+    }
+
+
+@router.delete("/api/sql/meters/{meter_no}")
+def delete_sql_meter_data(meter_no: str):
+    normalized_meter_no = validate_non_empty_text(meter_no, "meter_no")
+    result = delete_meter_data_from_sql(normalized_meter_no)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        **result,
+    }
+
+
+@router.get("/api/sql/upload-history")
+def get_sql_upload_history(limit: int = Query(default=100, ge=1, le=1000)):
+    result = get_upload_history_from_sql(limit=limit)
+    return {
+        "status": "success",
+        "database": DB_NAME,
+        "table": DB_UPLOAD_HISTORY_TABLE,
+        **result,
+    }
 
 
 def _resolve_meter_scope(req: EsToSqlAllDataRequest):
