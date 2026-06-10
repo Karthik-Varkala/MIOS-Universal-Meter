@@ -5,7 +5,7 @@ from typing import Iterable
 
 from fastapi import HTTPException
 
-from .config import DB_HOST, DB_PASSWORD, DB_USER, ES_API_KEY, ES_ENDPOINT
+from .config import DB_HOST, DB_PASSWORD, DB_USER, ES_API_KEY, ES_CLOUD_ID
 from .logging_utils import append_invalid_record, get_logger, log_exception, log_with_context
 
 
@@ -184,7 +184,7 @@ def validate_runtime_configuration() -> dict[str, list[str]]:
     config_groups = {
         "elasticsearch": [
             name
-            for name, value in {"ES_ENDPOINT": ES_ENDPOINT, "ES_API_KEY": ES_API_KEY}.items()
+            for name, value in {"ES_CLOUD_ID": ES_CLOUD_ID, "ES_API_KEY": ES_API_KEY}.items()
             if not str(value or "").strip()
         ],
         "database": [

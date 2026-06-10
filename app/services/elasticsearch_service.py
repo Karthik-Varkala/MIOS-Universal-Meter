@@ -30,12 +30,11 @@ es_client = Elasticsearch(
     # ES_ENDPOINT,2
    cloud_id=ES_CLOUD_ID,
     api_key=ES_API_KEY,
+    verify_certs=False,
 
 )
+print("ES_CLOUD_ID =", ES_CLOUD_ID)
 logger = get_logger(__name__)
-ES_BULK_CHUNK_SIZE = 250
-ES_BULK_MAX_CHUNK_BYTES = 5 * 1024 * 1024
-ES_BULK_REQUEST_TIMEOUT = 120
 
 
 def _build_skipped_file_result(file_path: str, operation_name: str, exc: Exception) -> dict:
@@ -50,23 +49,19 @@ def _build_skipped_file_result(file_path: str, operation_name: str, exc: Excepti
 
 def publish_to_es_helper(data: list, index_name: str):
     try:
-        def actions():
-            for record in data:
-                action = {"_index": index_name}
-                if "_id" in record:
-                    action["_id"] = record["_id"]
-                    action["_source"] = {key: value for key, value in record.items() if key != "_id"}
-                else:
-                    action["_source"] = record
-                yield action
+        actions = []
+        for record in data:
+            action = {
+                "_index": index_name,
+                "_source": record,
+            }
 
-        success, _ = helpers.bulk(
-            es_client,
-            actions(),
-            chunk_size=ES_BULK_CHUNK_SIZE,
-            max_chunk_bytes=ES_BULK_MAX_CHUNK_BYTES,
-            request_timeout=ES_BULK_REQUEST_TIMEOUT,
-        )
+            if "_id" in record:
+                action["_id"] = record.pop("_id")
+
+            actions.append(action)
+
+        success, _ = helpers.bulk(es_client, actions)
         return {"message": f"Successfully inserted {success} records into {index_name}"}
     except Exception as exc:
         log_exception(logger, "Elasticsearch bulk insert failed", exc, index_name=index_name, record_count=len(data))

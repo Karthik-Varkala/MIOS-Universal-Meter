@@ -8,7 +8,6 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 
 from ... import parser
 from ...config import (
@@ -278,8 +277,7 @@ async def es_push_all_data(
     else:
         payload = await extract_all_data_paths(request)
 
-    return await run_in_threadpool(
-        publish_all_data_to_es,
+    return publish_all_data_to_es(
         file_path=payload.get("file_path"),
         directory_path=payload.get("directory_path"),
     )
@@ -295,10 +293,9 @@ async def es_push_all_data_upload(file: UploadFile = File(...)):
             temp_file_path = temp_file.name
             shutil.copyfileobj(file.file, temp_file)
 
-        result = await run_in_threadpool(publish_all_data_to_es, file_path=temp_file_path)
+        result = publish_all_data_to_es(file_path=temp_file_path)
         result["uploaded_filename"] = _safe_upload_name(file.filename)
-        result["upload_history_rows"] = await run_in_threadpool(
-            save_upload_history_rows,
+        result["upload_history_rows"] = save_upload_history_rows(
             [_build_upload_history_row(file.filename, os.path.getsize(temp_file_path), "file")]
         )
         return result
@@ -327,8 +324,8 @@ async def es_push_all_data_upload_folder(files: list[UploadFile] = File(...)):
                 _build_upload_history_row(upload.filename, os.path.getsize(destination), "folder")
             )
 
-        result = await run_in_threadpool(_publish_uploaded_directory, temp_dir, uploaded_names)
-        result["upload_history_rows"] = await run_in_threadpool(save_upload_history_rows, upload_history_rows)
+        result = _publish_uploaded_directory(temp_dir, uploaded_names)
+        result["upload_history_rows"] = save_upload_history_rows(upload_history_rows)
         return result
     finally:
         for upload in files:
